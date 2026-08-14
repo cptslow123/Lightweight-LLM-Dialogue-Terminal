@@ -1,0 +1,49 @@
+﻿# 虚拟环境
+.venv/
+venv/
+ENV/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 测试/临时
+tests/_probe_*.py
+tests/_temp_*.py
+tests/smoke.py
+tests/test_*.py
+
+# 配置（包含 API key）
+config.toml
+*.toml
+!config.example.toml
+
+# 数据库
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak

@@ -1,0 +1,698 @@
+"""Terminal REPL: input/completion -> commands -> streaming -> persistence."""
+import asyncio
+import html
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.table import Table
+from rich.text import Text
+
+from prompt_toolkit.completion import Completer, Completion, PathCompleter
+
+from . import __version__, api, ctx, web
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+COMMANDS = ["help", "new", "list", "switch", "rename", "delete", "clear",
+            "fork", "load", "model", "think", "attach", "compress", "usage", "info", "setting", "reload", "web", "unfold", "fold", "quit"]
+
+HELP_TEXT = """\
+[bold]llm-harness[/bold] 命令：
+  /new [标题]           新建会话
+  /list                 列出会话
+  /switch <id>          切换会话
+  /rename <id> <标题>   重命名
+  /delete <id>          删除会话
+  /clear                清空当前会话消息
+  /fork [标题]          复制当前会话为分支
+  /load <id> [N]        把另一会话最近 N 条插入当前上下文
+  /model <名称>         切换模型（Tab 补全）
+  /think <off|low|medium|high>  思考档位
+  /attach <路径...>     发送图片（也可直接输入图片路径）
+  /compress [N]         手动压缩最早 N 条消息为摘要
+  /usage                查看上下文占用
+  /unfold               展开本次思考链（完整内容）
+  /fold                重新折叠思考链（只显示尾部）
+  /info                 查看当前配置（窗口/输入/输出限制）
+  /web <搜索词>         联网搜索，结果注入上下文
+  /setting              新窗口打开配置向导（多 provider / key / url / 模型）
+  /reload               重新加载配置文件（/setting 后使用）
+  /quit /exit           退出
+  生成中 Ctrl+C 中断；输入中 Ctrl+C 清空
+"""
+
+# 自动联网搜索：模型需要实时信息时，第一行输出 [SEARCH: 查询词]，harness 检测后自动搜索并注入结果
+AUTO_SEARCH_PROMPT = (
+    "\n\n[自动联网搜索规则]\n"
+    "当用户的问题需要实时/最新信息（新闻、天气、股票、价格、实时事件、你的知识截止日期之后的事实）时，"
+    "或你无法确定答案时，请在回答的第一行只输出 [SEARCH: 搜索词]（不含其他内容），然后停止。"
+    "harness 会执行搜索并把结果作为[网络搜索结果]注入，请基于搜索结果作答并标注来源。"
+    "普通问题不需要搜索，直接正常回答。"
+)
+SEARCH_RE = re.compile(r"^\s*\[SEARCH:\s*([^\]]+?)\]\s*", re.MULTILINE)
+SEARCH_DIRECTIVE = """
+
+请直接基于以上搜索结果回答用户的问题，不要再输出 [SEARCH: ...]。如果搜索结果仍无法回答，请如实说明原因。"""
+
+
+class HarnessCompleter(Completer):
+    """Tab 补全：命令 / 模型 / 会话 id / 思考档位 / 图片路径。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        stripped = text.strip()
+        if not stripped.startswith("/"):
+            return
+        token = re.split(r"\s+", text)[-1] if text.strip() else ""
+        parts = stripped.split()
+        first = parts[0][1:] if parts else ""
+        if len(parts) <= 1 and not text.endswith((" ", "\t")):
+            # 补全命令本身（token 含前导 /，可整体替换）
+            for cmd in COMMANDS:
+                full = "/" + cmd
+                if full.startswith(token) and full != token:
+                    yield Completion(full, start_position=-len(token))
+            return
+        if len(parts) >= 2 or text.endswith((" ", "\t")):
+            if first == "model":
+                for m in self.app.all_model_pairs():
+                    if m.startswith(token) and m != token:
+                        yield Completion(m, start_position=-len(token))
+            elif first == "think":
+                for lv in ("off", "low", "medium", "high"):
+                    if lv.startswith(token) and lv != token:
+                        yield Completion(lv, start_position=-len(token))
+            elif first in ("switch", "load", "delete", "rename"):
+                for sid, title in self.app.sessions:
+                    s = str(sid)
+                    if s.startswith(token) and s != token:
+                        yield Completion(s, start_position=-len(token), display=f"{s}  {title}")
+            elif first == "attach":
+                yield from PathCompleter().get_completions(document, complete_event)
+
+
+class App:
+    def __init__(self, cfg, db, provider=None, model=None, thinking=None, console=None, config_path=None):
+        self.cfg = cfg
+        self.config_path = config_path
+        self.db = db
+        self.console = console or Console()
+        self.cli_provider = provider
+        self.cli_model = model
+        self.cli_thinking = thinking
+        self.conv = None
+        self.last_reasoning = ""
+
+    # ---- 状态 ----
+    @property
+    def defaults(self):
+        return self.cfg.get("defaults", {})
+
+    @property
+    def providers(self):
+        return self.cfg.get("providers", [])
+
+    @property
+    def provider_name(self):
+        return self.cli_provider or (self.conv["provider"] if self.conv else "") \
+            or self.defaults.get("provider", "") \
+            or (self.providers[0]["name"] if self.providers else "default")
+
+    def provider_cfg(self):
+        name = self.provider_name
+        for p in self.providers:
+            if p["name"] == name:
+                return p
+        return {"name": name, "base_url": "http://localhost:11434/v1", "api_key_env": "", "models": []}
+
+    def tavily_key(self):
+        return self.defaults.get("tavily_api_key") or os.environ.get("TAVILY_API_KEY", "")
+
+    def resolve_model(self):
+        models = self.provider_cfg().get("models", [])
+        return self.cli_model or (self.conv["model"] if self.conv else "") \
+            or self.defaults.get("model") or (models[0] if models else "")
+
+    def resolve_thinking(self):
+        return self.cli_thinking or (self.conv["thinking"] if self.conv else "") \
+            or self.defaults.get("thinking", "off")
+
+    def load_msgs(self):
+        return [api.Msg(role=r["role"], parts=json.loads(r["content"]), id=r["id"],
+                        hidden=bool(r["hidden"]), summary=bool(r["summary"]))
+                for r in self.db.get_messages(self.conv["id"])]
+
+    def all_model_pairs(self):
+        return sorted({f"{p['name']}:{m}" for p in self.providers for m in p.get("models", [])})
+
+    def refresh(self):
+        self.sessions = [(r["id"], r["title"]) for r in self.db.list_conversations(100)]
+
+    # ---- 启动 ----
+    def load_session(self, cid=None):
+        conv = self.db.get_conversation(cid) if cid else self.db.latest_conversation()
+        if conv is None:
+            model = self.defaults.get("model", "")
+            provider = next((p["name"] for p in self.providers if model in p.get("models", [])),
+                            (self.providers[0]["name"] if self.providers else "default"))
+            cid = self.db.new_conversation(
+                provider=provider,
+                model=model,
+                thinking=self.defaults.get("thinking", "off"),
+            )
+            conv = self.db.get_conversation(cid)
+        self.conv = conv
+
+    def run(self):
+        self.load_session()
+        self.console.print(f"[bold]llm-harness v{__version__}[/bold]  模型 [cyan]{self.resolve_model()}[/cyan]  "
+                           f"思考 [cyan]{self.resolve_thinking()}[/cyan]")
+        self.console.print("[dim]输入 /help 查看命令 · 图片路径可直接粘贴发送 · Ctrl+C 清空当前输入 · Tab 补全[/dim]")
+        while True:
+            self.enable_cursor_blink()
+            try:
+                line = self.read_line()
+            except KeyboardInterrupt:
+                self.console.print()
+                continue
+            except EOFError:
+                self.console.print()
+                break
+            if not line:
+                continue
+            if line.startswith("/"):
+                if not self.dispatch(line):
+                    break
+            else:
+                self.handle_input(line)
+        # 关闭会话：清空所有对话记录
+        self.db.wipe_all()
+
+    @staticmethod
+    def enable_cursor_blink():
+        # 尝试启用光标闪烁（Windows Terminal 支持；旧 conhost 由系统设置控制）
+        try:
+            sys.stdout.write("\x1b[?12h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    def read_line(self):
+        # TTY 下用 prompt_toolkit 提供 Tab 补全；管道/重定向时退回原生 input()
+        model = self.resolve_model()
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                from prompt_toolkit import prompt
+                from prompt_toolkit.formatted_text import HTML
+                return prompt(HTML(f"<ansiblue>{html.escape(model)}</ansiblue> > "),
+                              completer=HarnessCompleter(self)).strip()
+            except Exception:
+                pass
+        return input(f"{model} > ").strip()
+
+    # ---- 输入 ----
+    def handle_input(self, line):
+        parts = line.split()
+        images = [p for p in parts if p.lower().endswith(IMAGE_EXTS) and Path(p).exists()]
+        text = " ".join(p for p in parts if p not in images)
+        if not text and not images:
+            self.console.print("[dim](未识别到文字或图片路径)[/dim]")
+            return
+        try:
+            asyncio.run(self.send(text, images))
+        except KeyboardInterrupt:
+            self.console.print("[dim]生成已中断[/dim]")
+
+    # ---- 核心发送 ----
+    async def send(self, text, images):
+        conv = self.db.get_conversation(self.conv["id"])
+        cfg = self.provider_cfg()
+        model = self.resolve_model()
+        thinking = self.resolve_thinking()
+        system_prompt = conv["system_prompt"] or self.defaults.get("system_prompt", "You are a helpful assistant.")
+        system_prompt += f"\n当前日期：{datetime.now().year}年{datetime.now().month}月{datetime.now().day}日"
+        system_prompt += AUTO_SEARCH_PROMPT
+        window = int(self.defaults.get("context_window", 8000))
+        threshold = float(self.defaults.get("compress_threshold", 0.75))
+        keep_last = int(self.defaults.get("compress_keep_last", 20))
+        max_tokens = int(self.defaults.get("max_tokens", 4096))
+        max_input = int(self.defaults.get("max_input", 10000))
+
+        if images:
+            self.console.print("[dim](图片: " + ", ".join(Path(i).name for i in images) + ")[/dim]")
+
+        user_msg = api.Msg(role="user", parts=api.parts_from_inputs(text, images))
+
+        async def do_round(include_user: bool):
+            msgs = self.load_msgs() + ([user_msg] if include_user else [])
+            send_msgs, stats = await ctx.prepare(msgs, system_prompt, cfg, model, window, threshold, keep_last,
+                                                 reserve=max_tokens, max_input=max_input)
+            for at_id, _, ids in stats["summaries"]:
+                self.db.mark_hidden(self.conv["id"], ids)
+            for at_id, sum_text, _ in stats["summaries"]:
+                self.db.add_message(self.conv["id"], "system",
+                                    [{"type": "text", "text": "[早期对话摘要] " + sum_text}], summary=1, at=at_id)
+            return send_msgs, stats
+
+        send, stats = await do_round(include_user=True)
+        self.db.add_message(self.conv["id"], "user", user_msg.parts)
+        if self.conv["title"] == "untitled" and text:
+            self.db.update_conversation(self.conv["id"], title=text[:30])
+        self.db.update_conversation(self.conv["id"], provider=self.provider_name, model=model, thinking=thinking)
+        self.conv = self.db.get_conversation(self.conv["id"])
+        self.refresh()
+
+        t0 = time.perf_counter()
+        search_round = 0
+        last_context = ""
+        while True:
+            search_round += 1
+            assistant_text, reasoning, usage, error = await self.stream_render(cfg, model, send, thinking, max_tokens)
+            m = SEARCH_RE.match(assistant_text) if assistant_text and not error else None
+            if m and search_round < 2:
+                # 搜索标记轮：静默联网，不打印思考链/标记，只留一行过渡提示
+                query = m.group(1).strip()
+                self.console.print(f"[dim]已联网搜索: {query}[/dim]")
+                try:
+                    results = web.web_search(query, 5, self.tavily_key())
+                except Exception as e:
+                    self.console.print(f"[red]自动搜索失败: {e}[/red]")
+                    break
+                if not results:
+                    self.console.print("[red]没有搜索结果[/red]")
+                    break
+                lines = [f"[网络搜索结果] 查询: {query}"]
+                for i, r in enumerate(results, 1):
+                    lines.append(f"\n{i}. {r.get('title', '')}")
+                    body = (r.get("body") or "").strip()
+                    if body:
+                        lines.append(f"   {body[:400]}")
+                    if r.get("href"):
+                        lines.append(f"   来源: {r['href']}")
+                results_text = "\n".join(lines)
+                last_context = results_text
+                self.db.add_message(self.conv["id"], "system",
+                                    [{"type": "text", "text": results_text + SEARCH_DIRECTIVE}])
+                self.refresh()
+                send, stats = await do_round(include_user=False)
+                continue
+            if error:
+                if reasoning:
+                    self.console.print(self.reasoning_view(reasoning))
+                if assistant_text:
+                    self.console.print(Markdown(assistant_text))
+                    self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
+            elif m:
+                # 模型第二轮仍输出搜索标记：不保存标记，直接展示搜索结果兜底
+                if last_context:
+                    self.console.print("[yellow]模型未直接作答，已展示搜索结果：[/yellow]")
+                    self.console.print(Markdown(last_context))
+            else:
+                if reasoning:
+                    self.console.print(self.reasoning_view(reasoning))
+                if assistant_text:
+                    self.console.print(Markdown(assistant_text))
+                    self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
+            break
+        elapsed = time.perf_counter() - t0
+        self.print_usage(stats, window, usage, max_tokens, max_input, elapsed)
+        if error:
+            self.console.print(f"[red]{error}[/red]")
+            if "网络错误" in error or "network error" in error:
+                self.console.print("[dim]提示：请检查网络连接；/info 查看 base_url 与模型；/setting 重新配置[/dim]")
+
+    async def stream_render(self, cfg, model, send, thinking, max_tokens=None):
+        text, reasoning, usage, error = "", "", None, None
+        interrupted = False
+        self.last_reasoning = ""
+        t0 = time.perf_counter()
+
+        def view():
+            if SEARCH_RE.match(text):
+                return Text(f"… 生成中 {time.perf_counter() - t0:.1f}s", style="dim")
+            return self._stream_view(reasoning, text, time.perf_counter() - t0)
+
+        try:
+            with Live(console=self.console, refresh_per_second=20, vertical_overflow="crop", transient=True) as live:
+                async def status_loop():
+                    while True:
+                        await asyncio.sleep(0.5)
+                        live.update(view())
+                tick = asyncio.create_task(status_loop())
+                try:
+                    async for block in api.stream_chat(cfg, model, send, thinking, max_tokens):
+                        if block.error:
+                            error = block.error
+                            break
+                        text, reasoning, usage = block.text, block.reasoning, block.usage
+                        self.last_reasoning = reasoning
+                        live.update(view())
+                finally:
+                    tick.cancel()
+        except KeyboardInterrupt:
+            interrupted = True
+        if interrupted:
+            self.console.print("[dim]（已中断，保留已生成部分）[/dim]")
+        return text, reasoning, usage, error
+
+    def _stream_view(self, reasoning, text, elapsed):
+        parts = []
+        if reasoning:
+            parts.append(self.reasoning_view(reasoning))
+        if text:
+            parts.append(Text(text))
+        parts.append(Text(f"\u2026 生成中 {elapsed:.1f}s", style="dim"))
+        return Group(*parts)
+
+    @staticmethod
+    def reasoning_view(reasoning):
+        lines = reasoning.splitlines()
+        total = len(lines)
+        shown = lines[-5:] if total > 5 else lines
+        view = Text(style="dim")
+        for i, ln in enumerate(shown):
+            t = Text(ln)
+            t.truncate(76, overflow="ellipsis")
+            if i:
+                view.append("\n")
+            view.append_text(t)
+        if total > 5:
+            view.append(f"\n… 共 {total} 行，输入 /unfold 展开")
+        return view
+
+    def print_usage(self, stats, window, usage=None, reserve=0, max_input=0, elapsed=None):
+        budget = min(window - reserve, max_input) if max_input else window - reserve
+        line = f"[dim]tokens ≈ {stats['estimated']} / {budget}"
+        if reserve:
+            line += f" · 输出预留 {reserve}"
+        if usage:
+            line += f" · api {usage.get('total_tokens', '?')}"
+        if elapsed is not None:
+            line += f" · 耗时 {elapsed:.1f}s"
+        if stats["compressed"]:
+            line += f" · 压缩 {stats['compressed']} 条"
+        if stats["dropped"]:
+            line += f" · 截断 {stats['dropped']} 条"
+        self.console.print(line + "[/dim]")
+
+    # ---- 命令 ----
+    def dispatch(self, line) -> bool:
+        words = line.split()
+        cmd, args = words[0][1:].lower(), words[1:]
+        handler = getattr(self, f"cmd_{cmd}", None)
+        if handler is None:
+            self.console.print(f"[yellow]未知命令 /{cmd}，输入 /help 查看[/yellow]")
+            return True
+        return handler(args)
+
+    def cmd_help(self, args):
+        self.console.print(HELP_TEXT)
+        return True
+
+    def cmd_quit(self, args):
+        self.console.print("[dim]再见[/dim]")
+        return False
+
+    cmd_exit = cmd_quit
+
+    def cmd_new(self, args):
+        title = " ".join(args) or "untitled"
+        cid = self.db.new_conversation(title=title, provider=self.provider_name, model=self.resolve_model(),
+                                       thinking=self.resolve_thinking())
+        self.conv = self.db.get_conversation(cid)
+        self.refresh()
+        self.console.print("[green]已新建会话[/green]")
+        return True
+
+    def cmd_list(self, args):
+        rows = self.db.list_conversations()
+        if not rows:
+            self.console.print("[dim]暂无会话[/dim]")
+            return True
+        table = Table(title="会话")
+        for col in ("id", "title", "model", "updated_at"):
+            table.add_column(col)
+        for r in rows:
+            table.add_row(str(r["id"]), r["title"][:30], r["model"], r["updated_at"][:16])
+        self.console.print(table)
+        return True
+
+    def _conv_id(self, args):
+        if not args:
+            self.console.print("[yellow]缺少会话 id[/yellow]")
+            return None
+        try:
+            return int(args[0])
+        except ValueError:
+            self.console.print("[yellow]id 必须是数字[/yellow]")
+            return None
+
+    def cmd_switch(self, args):
+        if not args:
+            self.console.print("[yellow]用法: /switch <id>，输入 /list 查看会话[/yellow]")
+            return True
+        cid = self._conv_id(args)
+        if cid is None:
+            return True
+        conv = self.db.get_conversation(cid)
+        if not conv:
+            self.console.print("[red]会话不存在[/red]")
+            return True
+        self.conv = conv
+        self.refresh()
+        self.console.print(f"[green]已切换: 「{conv['title']}」[/green]")
+        return True
+
+    def cmd_rename(self, args):
+        cid = self._conv_id(args)
+        if cid is None or len(args) < 2:
+            return True
+        self.db.update_conversation(cid, title=" ".join(args[1:]))
+        if self.conv["id"] == cid:
+            self.conv = self.db.get_conversation(cid)
+        self.refresh()
+        self.console.print("[green]已重命名[/green]")
+        return True
+
+    def cmd_delete(self, args):
+        cid = self._conv_id(args)
+        if cid is None:
+            return True
+        self.db.delete_conversation(cid)
+        if self.conv["id"] == cid:
+            self.load_session()
+        self.refresh()
+        self.console.print("[green]已删除会话[/green]")
+        return True
+
+    def cmd_clear(self, args):
+        self.db.clear_messages(self.conv["id"])
+        self.console.print("[green]已清空当前会话消息[/green]")
+        return True
+
+    def cmd_fork(self, args):
+        cid = self.db.new_conversation(title=(" ".join(args) or self.conv["title"] + " (fork)"),
+                                       system_prompt=self.conv["system_prompt"], provider=self.conv["provider"],
+                                       model=self.conv["model"], thinking=self.conv["thinking"])
+        for m in self.db.get_messages(self.conv["id"], include_hidden=True):
+            self.db.add_message(cid, m["role"], json.loads(m["content"]), m["hidden"], m["summary"])
+        self.conv = self.db.get_conversation(cid)
+        self.refresh()
+        self.console.print("[green]已分支到新会话[/green]")
+        return True
+
+    def cmd_load(self, args):
+        cid = self._conv_id(args)
+        if cid is None:
+            return True
+        n = None
+        if len(args) > 1:
+            try:
+                n = int(args[1])
+            except ValueError:
+                pass
+        rows = self.db.get_messages(cid)
+        if n:
+            rows = rows[-n:]
+        for m in rows:
+            self.db.add_message(self.conv["id"], m["role"], json.loads(m["content"]))
+        self.refresh()
+        self.console.print(f"[green]已载入 {len(rows)} 条消息[/green]")
+        return True
+
+    def cmd_model(self, args):
+        if not args:
+            self.console.print(f"[dim]当前模型: {self.resolve_model()}[/dim]")
+            avail = self.all_model_pairs()
+            if avail:
+                self.console.print("[dim]可用模型: " + ", ".join(avail) + "[/dim]")
+            return True
+        name = args[0]
+        if ":" in name:
+            pname, mname = name.split(":", 1)
+            for p in self.providers:
+                if p["name"] == pname:
+                    self.db.update_conversation(self.conv["id"], provider=pname, model=mname)
+                    self.conv = self.db.get_conversation(self.conv["id"])
+                    self.refresh()
+                    self.console.print(f"[green]模型已切换: {pname}:{mname}[/green]")
+                    return True
+            self.console.print(f"[yellow]未找到 provider: {pname}[/yellow]")
+            return True
+        for p in self.providers:
+            if name in p.get("models", []):
+                self.db.update_conversation(self.conv["id"], provider=p["name"], model=name)
+                self.conv = self.db.get_conversation(self.conv["id"])
+                self.refresh()
+                self.console.print(f"[green]模型已切换: {name} ({p['name']})[/green]")
+                return True
+        self.db.update_conversation(self.conv["id"], model=name)
+        self.conv = self.db.get_conversation(self.conv["id"])
+        self.console.print(f"[green]模型已切换: {name}[/green]")
+        return True
+
+    def cmd_think(self, args):
+        if not args:
+            self.console.print(f"[dim]当前思考档位: {self.resolve_thinking()}（off | low | medium | high）[/dim]")
+            return True
+        level = args[0].lower()
+        if level not in ("off", "low", "medium", "high"):
+            self.console.print("[yellow]档位: off | low | medium | high[/yellow]")
+            return True
+        self.db.update_conversation(self.conv["id"], thinking=level)
+        self.conv = self.db.get_conversation(self.conv["id"])
+        self.console.print(f"[green]思考档位: {level}[/green]")
+        return True
+
+    def cmd_attach(self, args):
+        images = [p for p in args if p.lower().endswith(IMAGE_EXTS) and Path(p).exists()]
+        if not images:
+            self.console.print("[yellow]用法: /attach <图片路径>，或直接粘贴图片路径发送[/yellow]")
+            return True
+        asyncio.run(self.send("", images))
+        return True
+
+    def cmd_web(self, args):
+        if not args:
+            self.console.print("[yellow]用法: /web <搜索词>[/yellow]")
+            return True
+        query = " ".join(args)
+        self.console.print(f"[dim]正在搜索: {query}[/dim]")
+
+        async def do():
+            try:
+                results = web.web_search(query, 5, self.tavily_key())
+            except Exception as e:
+                self.console.print(f"[red]搜索失败: {e}[/red]")
+                return
+            if not results:
+                self.console.print("[red]没有搜索结果[/red]")
+                return
+            lines = [f"[网络搜索结果] 查询: {query}"]
+            for i, r in enumerate(results, 1):
+                lines.append(f"\n{i}. {r.get('title', '')}")
+                body = (r.get("body") or "").strip()
+                if body:
+                    lines.append(f"   {body[:400]}")
+                if r.get("href"):
+                    lines.append(f"   来源: {r['href']}")
+            context = "\n".join(lines)
+            self.db.add_message(self.conv["id"], "system", [{"type": "text", "text": context}])
+            self.refresh()
+            await self.send(query, [])
+
+        asyncio.run(do())
+        return True
+
+    def cmd_compress(self, args):
+        n = None
+        if args:
+            try:
+                n = int(args[0])
+            except ValueError:
+                pass
+
+        async def do():
+            cfg = self.provider_cfg()
+            model = self.resolve_model()
+            batch = [m for m in self.load_msgs() if not m.summary and m.role != "system"][: (n or 20)]
+            if not batch:
+                self.console.print("[dim]没有可压缩的消息[/dim]")
+                return
+            text = await ctx.compress(batch, cfg, model)
+            if not text:
+                self.console.print("[red]压缩失败[/red]")
+                return
+            at = batch[0].id
+            self.db.mark_hidden(self.conv["id"], [m.id for m in batch])
+            self.db.add_message(self.conv["id"], "system", [{"type": "text", "text": "[早期对话摘要] " + text}], summary=1, at=at)
+            self.refresh()
+            self.console.print(f"[green]已压缩 {len(batch)} 条消息为摘要[/green]")
+
+        asyncio.run(do())
+        return True
+
+    def cmd_info(self, args):
+        cfg = self.provider_cfg()
+        self.console.print("[bold]当前配置[/bold]")
+        self.console.print(f"provider: [cyan]{self.provider_name}[/cyan]  ({cfg.get('base_url', '')})")
+        self.console.print(f"model: [cyan]{self.resolve_model()}[/cyan]")
+        self.console.print(f"thinking: [cyan]{self.resolve_thinking()}[/cyan]")
+        self.console.print(f"context_window: {self.defaults.get('context_window', 8000)}")
+        self.console.print(f"max_input: {self.defaults.get('max_input', 10000)}")
+        self.console.print(f"max_tokens: {self.defaults.get('max_tokens', 4096)}")
+        self.console.print("tavily: " + ("\u5df2\u914d\u7f6e" if self.tavily_key() else "\u672a\u914d\u7f6e"))
+        return True
+
+    def cmd_setting(self, args):
+        import subprocess
+        path = self.config_path or os.environ.get("LLM_HARNESS_CONFIG", str(Path.home() / ".llm_harness" / "config.toml"))
+        cmd = [sys.executable, "-m", "llm_harness.settings", "--config", path]
+        if os.name == "nt":
+            subprocess.Popen(cmd, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        else:
+            subprocess.Popen(cmd)
+        self.console.print("[green]已在新窗口打开设置向导，完成后回来输入 /reload 生效[/green]")
+        return True
+
+    def cmd_reload(self, args):
+        import tomllib
+        path = self.config_path
+        if not path or not Path(path).exists():
+            self.console.print("[yellow]未找到配置文件，无法重载[/yellow]")
+            return True
+        with open(path, "rb") as f:
+            self.cfg = tomllib.load(f)
+        self.refresh()
+        self.console.print("[green]配置已重载[/green]")
+        return True
+
+    def cmd_unfold(self, args):
+        if not self.last_reasoning:
+            self.console.print("[dim]本次没有思考链[/dim]")
+            return True
+        self.console.print(Text(self.last_reasoning, style="dim"))
+        return True
+
+    def cmd_fold(self, args):
+        if not self.last_reasoning:
+            self.console.print("[dim]本次没有思考链[/dim]")
+            return True
+        self.console.print(self.reasoning_view(self.last_reasoning))
+        return True
+
+    def cmd_usage(self, args):
+        msgs = self.load_msgs()
+        self.console.print(f"[dim]消息 {len(msgs)} 条 · 估算 {ctx.estimate_messages(msgs)} tokens "
+                           f"(窗口 {self.defaults.get('context_window', 8000)})[/dim]")
+        return True
