@@ -7,8 +7,8 @@ thinking = "off"                 # 思考档位：off | low | medium | high
 context_window = 262144          # 上下文窗口（token）
 compress_threshold = 0.75        # 低于此比例自动压缩历史
 compress_keep_last = 20          # 压缩时保留最近 N 条消息
-max_input = 10000                # 单次输入 token 上限
-max_tokens = 20000               # 单次输出 token 上限
+max_input = 20000                # 单次输入 token 上限
+max_tokens = 25000               # 单次输出 token 上限
 tavily_api_key = ""              # Tavily 联网搜索 key（https://tavily.com 获取）
 system_prompt = "You are a helpful, friendly AI assistant. 回答一律使用中文（除非用户明确要求其他语言）。回答要准确、直接、友好；对于时效性、实时性信息（新闻、天气、价格、最新事件等），不确定时不要编造，可以通过联网搜索获取最新信息后作答。"
 

@@ -9,8 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from rich.console import Console, Group
-from rich.live import Live
+from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
@@ -57,6 +56,19 @@ AUTO_SEARCH_PROMPT = (
     "普通问题不需要搜索，直接正常回答。"
 )
 SEARCH_RE = re.compile(r"^\s*\[SEARCH:\s*([^\]]+?)\]\s*", re.MULTILINE)
+SEARCH_PREFIX_RE = re.compile(r"^\s*\[SEARCH:")
+def _safe_flush_len(text: str) -> int:
+    """返回可安全渲染的 Markdown 前缀长度：代码围栏闭合处或空行结束的完整块。"""
+    lines = text.splitlines(keepends=True)
+    fence = False
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("```"):
+            fence = not fence
+            if not fence:
+                return sum(len(l) for l in lines[: i + 1])
+        elif not fence and i > 0 and ln.strip() == "":
+            return sum(len(l) for l in lines[: i + 1])
+    return 0
 SEARCH_DIRECTIVE = """
 
 请直接基于以上搜索结果回答用户的问题，不要再输出 [SEARCH: ...]。如果搜索结果仍无法回答，请如实说明原因。"""
@@ -214,7 +226,7 @@ class App:
             try:
                 from prompt_toolkit import prompt
                 from prompt_toolkit.formatted_text import HTML
-                return prompt(HTML(f"<ansiblue>{html.escape(model)}</ansiblue> > "),
+                return prompt(HTML(f"<ansibrightblue>{html.escape(model)}</ansibrightblue> > "),
                               completer=HarnessCompleter(self)).strip()
             except Exception:
                 pass
@@ -307,10 +319,7 @@ class App:
                 send, stats = await do_round(include_user=False)
                 continue
             if error:
-                if reasoning:
-                    self.console.print(self.reasoning_view(reasoning))
                 if assistant_text:
-                    self.console.print(Markdown(assistant_text))
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
             elif m:
                 # 模型第二轮仍输出搜索标记：不保存标记，直接展示搜索结果兜底
@@ -318,10 +327,7 @@ class App:
                     self.console.print("[yellow]模型未直接作答，已展示搜索结果：[/yellow]")
                     self.console.print(Markdown(last_context))
             else:
-                if reasoning:
-                    self.console.print(self.reasoning_view(reasoning))
                 if assistant_text:
-                    self.console.print(Markdown(assistant_text))
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
             break
         elapsed = time.perf_counter() - t0
@@ -336,43 +342,66 @@ class App:
         interrupted = False
         self.last_reasoning = ""
         t0 = time.perf_counter()
+        pending = ""
+        consumed = 0
+        reasoning_shown = False
+        status = ""
 
-        def view():
-            if SEARCH_RE.match(text):
-                return Text(f"… 生成中 {time.perf_counter() - t0:.1f}s", style="dim")
-            return self._stream_view(reasoning, text, time.perf_counter() - t0)
+        def show_status(msg):
+            nonlocal status
+            status = msg
+            self.console.print(Text(msg.ljust(50)), end="\r")
+
+        def clear_status():
+            nonlocal status
+            if status:
+                self.console.print(Text(" " * 50), end="\r")
+                status = ""
 
         try:
-            with Live(console=self.console, refresh_per_second=20, vertical_overflow="crop", transient=True) as live:
-                async def status_loop():
-                    while True:
-                        await asyncio.sleep(0.5)
-                        live.update(view())
-                tick = asyncio.create_task(status_loop())
-                try:
-                    async for block in api.stream_chat(cfg, model, send, thinking, max_tokens):
-                        if block.error:
-                            error = block.error
-                            break
-                        text, reasoning, usage = block.text, block.reasoning, block.usage
-                        self.last_reasoning = reasoning
-                        live.update(view())
-                finally:
-                    tick.cancel()
+            async for block in api.stream_chat(cfg, model, send, thinking, max_tokens):
+                if block.error:
+                    error = block.error
+                    break
+                text, reasoning, usage = block.text, block.reasoning, block.usage
+                self.last_reasoning = reasoning
+                if SEARCH_PREFIX_RE.match(text):
+                    show_status(f"… 生成中 {time.perf_counter() - t0:.1f}s")
+                    continue
+                if not text:
+                    if reasoning:
+                        show_status(f"… 思考中 {time.perf_counter() - t0:.1f}s")
+                    continue
+                clear_status()
+                if reasoning and not reasoning_shown:
+                    reasoning_shown = True
+                    self.console.print(self.reasoning_view(reasoning))
+                if len(text) > consumed:
+                    pending += text[consumed:].replace("\r", "").replace("\x1b", "")
+                    consumed = len(text)
+                while pending:
+                    n = _safe_flush_len(pending)
+                    if n == 0 and len(pending) < 3000:
+                        break
+                    if n == 0:
+                        idx = pending.rfind("\n")
+                        n = idx + 1 if idx >= 0 else len(pending)
+                    self.console.print(Markdown(pending[:n]))
+                    pending = pending[n:]
+                if pending:
+                    show_status(f"… 生成中 {time.perf_counter() - t0:.1f}s")
         except KeyboardInterrupt:
             interrupted = True
+        finally:
+            clear_status()
+            if reasoning and not reasoning_shown and not SEARCH_PREFIX_RE.match(text):
+                self.console.print(self.reasoning_view(reasoning))
+            if not SEARCH_RE.match(text) and pending:
+                self.console.print(Markdown(pending))
+                pending = ""
         if interrupted:
             self.console.print("[dim]（已中断，保留已生成部分）[/dim]")
         return text, reasoning, usage, error
-
-    def _stream_view(self, reasoning, text, elapsed):
-        parts = []
-        if reasoning:
-            parts.append(self.reasoning_view(reasoning))
-        if text:
-            parts.append(Text(text))
-        parts.append(Text(f"\u2026 生成中 {elapsed:.1f}s", style="dim"))
-        return Group(*parts)
 
     @staticmethod
     def reasoning_view(reasoning):
