@@ -10,9 +10,24 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
-from rich.markdown import Markdown
+from rich.markdown import Markdown, TableElement
 from rich.table import Table
 from rich.text import Text
+
+
+class _WrapTable(TableElement):
+    """表格单元格超宽时换行（fold）而不是省略号截断，避免正文内容被隐藏。"""
+
+    def __rich_console__(self, console, options):
+        for item in super().__rich_console__(console, options):
+            if isinstance(item, Table):
+                for col in item.columns:
+                    col.overflow = "fold"
+            yield item
+
+
+class MarkdownWrap(Markdown):
+    elements = {**Markdown.elements, "table_open": _WrapTable}
 
 from prompt_toolkit.completion import Completer, Completion, PathCompleter
 
@@ -373,7 +388,7 @@ class App:
                 # 模型第二轮仍输出搜索标记：不保存标记，直接展示搜索结果兜底
                 if last_context:
                     self.console.print("[yellow]模型未直接作答，已展示搜索结果：[/yellow]")
-                    self.console.print(Markdown(last_context))
+                    self.console.print(MarkdownWrap(last_context))
             else:
                 if assistant_text:
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
@@ -393,6 +408,8 @@ class App:
         pending = ""
         consumed = 0
         reasoning_shown = False
+        rz_printed = 0        # 已按完整行打印的 reasoning 长度
+        rz_streaming = False  # reasoning 正在流式显示时暂停 ticker
         status = ""
 
         def show_status(msg):
@@ -411,9 +428,25 @@ class App:
             try:
                 while True:
                     await asyncio.sleep(0.5)
-                    show_status(f"… 处理中 {time.perf_counter() - t0:.1f}s")
+                    if not rz_streaming:
+                        show_status(f"… 处理中 {time.perf_counter() - t0:.1f}s")
             except asyncio.CancelledError:
                 pass
+
+        def flush_reasoning(reasoning: str):
+            """把 reasoning 中新完成的完整行流式打印出来（滚动友好，不重复）。"""
+            nonlocal rz_printed, rz_streaming, reasoning_shown
+            new = reasoning[rz_printed:]
+            idx = new.rfind("\n")
+            if idx < 0:
+                return  # 还没有完整行
+            if not rz_streaming:
+                clear_status()
+                rz_streaming = True
+            for ln in new[:idx].split("\n"):
+                self.console.print(Text(ln, style="dim"))
+            rz_printed = len(reasoning) - (len(new) - idx - 1)
+            reasoning_shown = True
 
         ticker = asyncio.create_task(status_ticker())
 
@@ -422,16 +455,18 @@ class App:
                 if block.error:
                     error = block.error
                     break
-                text, reasoning, usage = block.text, block.reasoning, block.usage
+                text, usage = block.text, block.usage
+                reasoning = block.reasoning.replace("\r", "")
                 self.last_reasoning = reasoning
                 if SEARCH_PREFIX_RE.match(text):
                     show_status(f"… 生成中 {time.perf_counter() - t0:.1f}s")
                     continue
                 if not text:
                     if reasoning:
-                        show_status(f"… 思考中 {time.perf_counter() - t0:.1f}s")
+                        flush_reasoning(reasoning)
                     continue
                 clear_status()
+                rz_streaming = False
                 if reasoning and not reasoning_shown:
                     reasoning_shown = True
                     self.console.print(self.reasoning_view(reasoning))
@@ -445,7 +480,7 @@ class App:
                     if n == 0:
                         idx = pending.rfind("\n")
                         n = idx + 1 if idx >= 0 else len(pending)
-                    self.console.print(Markdown(pending[:n]))
+                    self.console.print(MarkdownWrap(pending[:n]))
                     pending = pending[n:]
                 if pending:
                     show_status(f"… 生成中 {time.perf_counter() - t0:.1f}s")
@@ -458,7 +493,7 @@ class App:
             if reasoning and not reasoning_shown and not SEARCH_PREFIX_RE.match(text):
                 self.console.print(self.reasoning_view(reasoning))
             if not SEARCH_RE.match(text) and pending:
-                self.console.print(Markdown(pending))
+                self.console.print(MarkdownWrap(pending))
                 pending = ""
         if interrupted:
             self.console.print("[dim]（已中断，保留已生成部分）[/dim]")
@@ -471,11 +506,9 @@ class App:
         shown = lines[-5:] if total > 5 else lines
         view = Text(style="dim")
         for i, ln in enumerate(shown):
-            t = Text(ln)
-            t.truncate(76, overflow="ellipsis")
             if i:
                 view.append("\n")
-            view.append_text(t)
+            view.append_text(Text(ln))
         if total > 5:
             view.append(f"\n… 共 {total} 行，输入 /unfold 展开")
         return view
