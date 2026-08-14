@@ -39,6 +39,15 @@ python -m llm_harness
 - PDF/docx/xlsx：本地提取文字后注入上下文，需安装可选依赖：`pip install -e ".[files]"`（或运行 install.bat 自动安装）。
 - 使用方式：直接拖入终端、粘贴路径，或 `/attach <路径...>`；路径含空格时自动带引号即可。
 
+## 联网搜索
+- 需要 Tavily key（免费注册：https://tavily.com），二选一：
+  1. 运行 `/setting`，在「Tavily API key（联网搜索）」处填入自己的 key；
+  2. 手动编辑 `~/.llm_harness/config.toml` 的 `defaults.tavily_api_key`，或设置环境变量 `TAVILY_API_KEY`。
+- 两种用法：
+  - 手动：`/web 关键词`，立即搜索并把结果注入上下文；
+  - 自动：直接提问，模型判断需要实时/最新信息时输出 `[SEARCH: 关键词]`，harness 自动搜索并注入结果，再基于结果作答（默认倾向搜索）。
+- 不配置 key 也能正常聊天，只是联网搜索不可用（会提示缺少 key）。
+
 ## 测试
 ```powershell
 .\.venv\Scripts\python tests\smoke.py   # mock 服务器端到端冒烟

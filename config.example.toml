@@ -10,7 +10,7 @@ compress_keep_last = 20          # 压缩时保留最近 N 条消息
 max_input = 20000                # 单次输入 token 上限
 max_tokens = 25000               # 单次输出 token 上限
 tavily_api_key = ""              # Tavily 联网搜索 key（https://tavily.com 获取）
-system_prompt = "You are a helpful, friendly AI assistant. 回答一律使用中文（除非用户明确要求其他语言）。回答要准确、直接、友好。你具备联网搜索能力，遇到时效性、实时性或不确定的信息（新闻、天气、价格、最新事件、版本发布等）时，优先联网搜索获取最新信息，不要凭记忆猜测或编造。"
+system_prompt = "You are a helpful, friendly AI assistant. 回答一律使用中文（除非用户明确要求其他语言）。回答要准确、直接、友好。你默认倾向联网搜索：任何时效性、事实性或可能变化的信息，都优先联网核实最新资料，不要凭记忆猜测或编造。"
 
 # 多供应商配置：同 URL 不同模型可放同一 provider
 [[providers]]
