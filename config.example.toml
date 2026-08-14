@@ -1,20 +1,22 @@
-# 复制为 ~/.llm_harness/config.toml 使用
+﻿# 配置说明：复制此文件为 config.toml 并填入你的配置
+# 原配置位于 ~/.llm_harness/config.toml
+
 [defaults]
-model = "deepseek-chat"
-thinking = "off"            # off | low | medium | high
-context_window = 262144     # 总上下文窗口（token），按模型真实值填
-compress_threshold = 0.75   # 上下文占用超过窗口的此比例时自动压缩
-compress_keep_last = 20     # 压缩时保留最近 N 条完整消息
-max_input = 10000            # 单次请求输入上限
-max_tokens = 20000           # 单次回复最大输出 token
-tavily_api_key = ""            # Tavily 联网搜索 key（https://tavily.com 获取），/setting 可配置
+model = "deepseek-chat"          # 默认模型（支持 provider:model 格式）
+thinking = "off"                 # 思考档位：off | low | medium | high
+context_window = 262144          # 上下文窗口（token）
+compress_threshold = 0.75        # 低于此比例自动压缩历史
+compress_keep_last = 20          # 压缩时保留最近 N 条消息
+max_input = 10000                # 单次输入 token 上限
+max_tokens = 20000               # 单次输出 token 上限
+tavily_api_key = ""              # Tavily 联网搜索 key（https://tavily.com 获取）
 system_prompt = "You are a helpful, friendly AI assistant. 回答一律使用中文（除非用户明确要求其他语言）。回答要准确、直接、友好；对于时效性、实时性信息（新闻、天气、价格、最新事件等），不确定时不要编造，可以通过联网搜索获取最新信息后作答。"
 
-# 可配多个 provider，/model 或启动参数 --provider 切换
+# 多供应商配置：同 URL 不同模型可放同一 provider
 [[providers]]
 name = "deepseek"
 base_url = "https://api.deepseek.com/v1"
-api_key_env = "DEEPSEEK_API_KEY"   # 留空则不带鉴权头
+api_key_env = "DEEPSEEK_API_KEY"  # 留空则使用 api_key 字段
 models = ["deepseek-chat", "deepseek-reasoner"]
 
 [[providers]]
@@ -22,3 +24,9 @@ name = "ollama"
 base_url = "http://localhost:11434/v1"
 api_key_env = ""
 models = ["qwen2.5:7b", "llama3.1:8b"]
+
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+models = ["gpt-4o", "gpt-4o-mini"]
