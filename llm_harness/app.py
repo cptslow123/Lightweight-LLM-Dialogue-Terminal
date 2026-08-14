@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from rich.cells import cell_len
 from rich.console import Console
 from rich.markdown import Markdown, TableElement
 from rich.table import Table
@@ -91,6 +92,29 @@ def _safe_flush_len(text: str) -> int:
         elif not fence and i > 0 and ln.strip() == "":
             return sum(len(l) for l in lines[: i + 1])
     return 0
+
+
+def _rz_row(line: str, width: int) -> Text:
+    """折叠面板行：截断到终端宽度并用空格补齐，保证原地覆盖干净。"""
+    t = Text(line, style="dim")
+    t.truncate(max(width - 2, 10), overflow="ellipsis")
+    pad = width - cell_len(t.plain)
+    if pad > 0:
+        t.append(" " * pad)
+    return t
+
+
+def _cursor_up(console, rows: int):
+    """终端光标上移 rows 行（原地重绘折叠面板用）。"""
+    if rows <= 0:
+        return
+    try:
+        console.file.write(f"\x1b[{rows}A")
+        console.file.flush()
+    except Exception:
+        pass
+
+
 SEARCH_DIRECTIVE = """
 
 请直接基于以上搜索结果回答用户的问题，不要再输出 [SEARCH: ...]。如果搜索结果仍无法回答，请如实说明原因。"""
@@ -410,8 +434,13 @@ class App:
         pending = ""
         consumed = 0
         reasoning_shown = False
-        rz_printed = 0        # 已按完整行打印的 reasoning 长度
+        rz_printed = 0        # 已按完整行消费的 reasoning 长度
         rz_streaming = False  # reasoning 正在流式显示时暂停 ticker
+        rz_total = 0          # reasoning 完整行总数
+        rz_window = []        # 最近 5 行文本（面板只显示这些，其余折叠）
+        rz_panel_rows = 0     # 当前折叠面板占用的终端行数（0 = 未绘制）
+        rz_finalized = False  # 面板是否已收尾成折叠视图
+        rz_tty = bool(getattr(self.console.file, "isatty", lambda: False)())
         status = ""
 
         def show_status(msg):
@@ -435,9 +464,45 @@ class App:
             except asyncio.CancelledError:
                 pass
 
+        def draw_rz_panel(header: str):
+            """原地重绘折叠面板：头部状态行 + 最近 5 行。"""
+            nonlocal rz_panel_rows
+            width = self.console.width or 80
+            _cursor_up(self.console, rz_panel_rows)
+            self.console.print(_rz_row(header, width))
+            for ln in rz_window:
+                self.console.print(_rz_row(ln, width))
+            rz_panel_rows = 1 + len(rz_window)
+            try:
+                self.console.file.flush()
+            except Exception:
+                pass
+
+        def finalize_rz_panel():
+            """思考结束：把面板收尾成折叠视图（最近 5 行 + 折叠提示）。"""
+            nonlocal rz_panel_rows, rz_finalized
+            if rz_finalized or rz_panel_rows == 0:
+                return
+            rz_finalized = True
+            width = self.console.width or 80
+            _cursor_up(self.console, rz_panel_rows)
+            rows = list(rz_window)
+            if rz_total > 5:
+                rows.append(f"… 共 {rz_total} 行，输入 /unfold 展开")
+            while len(rows) < rz_panel_rows:
+                rows.append("")
+            for row in rows[:rz_panel_rows]:
+                self.console.print(_rz_row(row, width))
+            try:
+                self.console.file.flush()
+            except Exception:
+                pass
+
         def flush_reasoning(reasoning: str):
-            """把 reasoning 中新完成的完整行流式打印出来（滚动友好，不重复）。"""
-            nonlocal rz_printed, rz_streaming, reasoning_shown
+            """新完成的完整行进入滚动折叠面板：最多显示 5 行，多的自动折叠。"""
+            nonlocal rz_printed, rz_streaming, reasoning_shown, rz_total, rz_window, rz_finalized
+            if rz_finalized:
+                return
             new = reasoning[rz_printed:]
             idx = new.rfind("\n")
             if idx < 0:
@@ -445,10 +510,18 @@ class App:
             if not rz_streaming:
                 clear_status()
                 rz_streaming = True
-            for ln in new[:idx].split("\n"):
-                self.console.print(Text(ln, style="dim"))
+            completed = new[:idx].split("\n")
+            rz_total += len(completed)
+            for ln in completed:
+                rz_window.append(ln)
+            del rz_window[:-5]
             rz_printed = len(reasoning) - (len(new) - idx - 1)
             reasoning_shown = True
+            if not rz_tty:  # 非交互输出（管道/测试）：退化为逐行打印
+                for ln in completed:
+                    self.console.print(Text(ln, style="dim"))
+                return
+            draw_rz_panel(f"思考中 · 已 {rz_total} 行 · {time.perf_counter() - t0:.1f}s")
 
         ticker = asyncio.create_task(status_ticker())
 
@@ -469,6 +542,8 @@ class App:
                     continue
                 clear_status()
                 rz_streaming = False
+                if rz_tty and reasoning_shown:
+                    finalize_rz_panel()
                 if reasoning and not reasoning_shown:
                     reasoning_shown = True
                     self.console.print(self.reasoning_view(reasoning))
@@ -490,8 +565,13 @@ class App:
             interrupted = True
         finally:
             ticker.cancel()
-            await ticker
+            try:
+                await ticker
+            except asyncio.CancelledError:
+                pass  # ticker 未启动即被取消时 await 会直接抛 CancelledError
             clear_status()
+            if rz_tty and reasoning_shown and rz_panel_rows and not rz_finalized:
+                finalize_rz_panel()
             if reasoning and not reasoning_shown and not SEARCH_PREFIX_RE.match(text):
                 self.console.print(self.reasoning_view(reasoning))
             if not SEARCH_RE.match(text) and pending:
