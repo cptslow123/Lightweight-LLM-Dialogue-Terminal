@@ -31,6 +31,7 @@ tests/test_*.py
 config.toml
 *.toml
 !config.example.toml
+!pyproject.toml
 
 # 数据库
 *.db

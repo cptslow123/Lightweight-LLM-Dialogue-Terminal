@@ -28,10 +28,16 @@ python -m llm_harness
 ## 命令
 `/new` 新建 · `/list` 列表 · `/switch <id>` 切换 · `/rename` `/delete` `/clear`
 `/fork` 分支 · `/load <id> [N]` 拼接历史 · `/model` `/think` 切换
-`/attach <路径>` 或直接粘贴图片路径发送 · `/compress` 手动压缩 · `/usage` 占用
+`/attach <路径>` 或直接把文件拖入终端发送 · `/compress` 手动压缩 · `/usage` 占用
 `/setting` 新窗口配置向导 · `/reload` 重载配置
 
-生成中 Ctrl+C 中断；输入中 Ctrl+C 清空。图片会被压缩为 1568px JPEG 后发送。
+生成中 Ctrl+C 中断；输入中 Ctrl+C 清空。
+
+## 附件
+- 图片（png/jpg/jpeg/webp/gif）：压缩为 1568px JPEG 后按多模态发送。
+- 文本文件（txt/md/csv/json/py 等）：直接读入作为文本。
+- PDF/docx/xlsx：本地提取文字后注入上下文，需安装可选依赖：`pip install -e ".[files]"`（或运行 install.bat 自动安装）。
+- 使用方式：直接拖入终端、粘贴路径，或 `/attach <路径...>`；路径含空格时自动带引号即可。
 
 ## 测试
 ```powershell

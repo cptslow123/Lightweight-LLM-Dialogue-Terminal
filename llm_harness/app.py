@@ -34,7 +34,7 @@ HELP_TEXT = """\
   /load <id> [N]        把另一会话最近 N 条插入当前上下文
   /model <名称>         切换模型（Tab 补全）
   /think <off|low|medium|high>  思考档位
-  /attach <路径...>     发送图片（也可直接输入图片路径）
+  /attach <路径...>     发送图片/文件（也可直接拖入终端）
   /compress [N]         手动压缩最早 N 条消息为摘要
   /usage                查看上下文占用
   /unfold               展开本次思考链（完整内容）
@@ -72,6 +72,27 @@ def _safe_flush_len(text: str) -> int:
 SEARCH_DIRECTIVE = """
 
 请直接基于以上搜索结果回答用户的问题，不要再输出 [SEARCH: ...]。如果搜索结果仍无法回答，请如实说明原因。"""
+
+# 按空白分词，保留引号内的空格并去掉引号（支持终端拖入带空格的文件路径）
+_PATH_TOKEN_RE = re.compile(r'"(?:[^"]*)"|\'(?:[^\']*)\'|\S+')
+
+def split_terms(line: str) -> list:
+    out = []
+    for m in _PATH_TOKEN_RE.finditer(line):
+        t = m.group(0)
+        if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+            t = t[1:-1]
+        out.append(t)
+    return out
+
+def classify_attachment(path: str):
+    """返回 'image' / 'file' / None（不支持的扩展名按普通文本处理）。"""
+    ext = Path(path).suffix.lower()
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in api.FILE_EXTS:
+        return "file"
+    return None
 
 
 class HarnessCompleter(Completer):
@@ -189,7 +210,7 @@ class App:
         self.load_session()
         self.console.print(f"[bold]llm-harness v{__version__}[/bold]  模型 [cyan]{self.resolve_model()}[/cyan]  "
                            f"思考 [cyan]{self.resolve_thinking()}[/cyan]")
-        self.console.print("[dim]输入 /help 查看命令 · 图片路径可直接粘贴发送 · Ctrl+C 清空当前输入 · Tab 补全[/dim]")
+        self.console.print("[dim]输入 /help 查看命令 · 拖入或粘贴图片/文件路径即可发送 · Ctrl+C 清空当前输入 · Tab 补全[/dim]")
         while True:
             self.enable_cursor_blink()
             try:
@@ -234,19 +255,28 @@ class App:
 
     # ---- 输入 ----
     def handle_input(self, line):
-        parts = line.split()
-        images = [p for p in parts if p.lower().endswith(IMAGE_EXTS) and Path(p).exists()]
-        text = " ".join(p for p in parts if p not in images)
-        if not text and not images:
-            self.console.print("[dim](未识别到文字或图片路径)[/dim]")
+        images, files, text_parts = [], [], []
+        for term in split_terms(line):
+            if Path(term).is_file():
+                kind = classify_attachment(term)
+                if kind == "image":
+                    images.append(term)
+                    continue
+                if kind == "file":
+                    files.append(term)
+                    continue
+            text_parts.append(term)
+        text = " ".join(text_parts).strip()
+        if not text and not images and not files:
+            self.console.print("[dim](未识别到文字或附件路径)[/dim]")
             return
         try:
-            asyncio.run(self.send(text, images))
+            asyncio.run(self.send(text, images, files))
         except KeyboardInterrupt:
             self.console.print("[dim]生成已中断[/dim]")
 
     # ---- 核心发送 ----
-    async def send(self, text, images):
+    async def send(self, text, images, files=None):
         conv = self.db.get_conversation(self.conv["id"])
         cfg = self.provider_cfg()
         model = self.resolve_model()
@@ -260,10 +290,23 @@ class App:
         max_tokens = int(self.defaults.get("max_tokens", 4096))
         max_input = int(self.defaults.get("max_input", 10000))
 
+        files = files or []
         if images:
             self.console.print("[dim](图片: " + ", ".join(Path(i).name for i in images) + ")[/dim]")
+        if files:
+            self.console.print("[dim](附件: " + ", ".join(Path(f).name for f in files) + ")[/dim]")
 
-        user_msg = api.Msg(role="user", parts=api.parts_from_inputs(text, images))
+        parts = api.parts_from_inputs(text, images)
+        for fp in files:
+            try:
+                content = api.extract_text(fp)
+            except Exception as e:
+                self.console.print(f"[red]附件 {Path(fp).name} 读取失败：{e}[/red]")
+                continue
+            if len(content) > api.MAX_FILE_CHARS:
+                content = content[:api.MAX_FILE_CHARS] + "\n…（内容过长已截断）"
+            parts.append({"type": "text", "text": f"[附件: {Path(fp).name}]\n{content}"})
+        user_msg = api.Msg(role="user", parts=parts)
 
         async def do_round(include_user: bool):
             msgs = self.load_msgs() + ([user_msg] if include_user else [])
@@ -358,6 +401,17 @@ class App:
                 self.console.print(Text(" " * 50), end="\r")
                 status = ""
 
+        # 上游慢（首 token 前/停顿）时也要显示处理时长：每 0.5s 刷新一次
+        async def status_ticker():
+            try:
+                while True:
+                    await asyncio.sleep(0.5)
+                    show_status(f"… 处理中 {time.perf_counter() - t0:.1f}s")
+            except asyncio.CancelledError:
+                pass
+
+        ticker = asyncio.create_task(status_ticker())
+
         try:
             async for block in api.stream_chat(cfg, model, send, thinking, max_tokens):
                 if block.error:
@@ -393,6 +447,8 @@ class App:
         except KeyboardInterrupt:
             interrupted = True
         finally:
+            ticker.cancel()
+            await ticker
             clear_status()
             if reasoning and not reasoning_shown and not SEARCH_PREFIX_RE.match(text):
                 self.console.print(self.reasoning_view(reasoning))
@@ -436,7 +492,7 @@ class App:
 
     # ---- 命令 ----
     def dispatch(self, line) -> bool:
-        words = line.split()
+        words = split_terms(line)
         cmd, args = words[0][1:].lower(), words[1:]
         handler = getattr(self, f"cmd_{cmd}", None)
         if handler is None:
@@ -604,11 +660,18 @@ class App:
         return True
 
     def cmd_attach(self, args):
-        images = [p for p in args if p.lower().endswith(IMAGE_EXTS) and Path(p).exists()]
-        if not images:
-            self.console.print("[yellow]用法: /attach <图片路径>，或直接粘贴图片路径发送[/yellow]")
+        images, files = [], []
+        for p in args:
+            if Path(p).is_file():
+                kind = classify_attachment(p)
+                if kind == "image":
+                    images.append(p)
+                elif kind == "file":
+                    files.append(p)
+        if not images and not files:
+            self.console.print("[yellow]用法: /attach <图片/文件路径>，或直接把文件拖入终端[/yellow]")
             return True
-        asyncio.run(self.send("", images))
+        asyncio.run(self.send("", images, files))
         return True
 
     def cmd_web(self, args):

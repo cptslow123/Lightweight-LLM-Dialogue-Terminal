@@ -8,6 +8,7 @@ from typing import AsyncIterator
 
 import httpx
 from PIL import Image
+from pathlib import Path
 
 MAX_IMAGE_EDGE = 1568  # OpenAI 视觉模型图片最大边
 
@@ -35,6 +36,61 @@ class StreamResult:
     reasoning: str = ""
     usage: dict | None = None
     error: str | None = None
+
+
+# 附件文本提取支持的类型（图片走 encode_image，不在此列）
+FILE_EXTS = (".txt", ".md", ".markdown", ".log", ".csv", ".json", ".py", ".js", ".ts",
+             ".html", ".htm", ".css", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+             ".sh", ".bat", ".cmd", ".ps1", ".tex", ".rst", ".pdf", ".docx", ".xlsx")
+MAX_FILE_CHARS = 100_000  # 单个附件提取后截断长度
+
+
+def extract_text(path: str) -> str:
+    """把附件内容提取为纯文本。缺依赖时抛 RuntimeError，由调用方提示安装。"""
+    p = Path(path)
+    ext = p.suffix.lower()
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            raise RuntimeError("读取 PDF 需要 pypdf：pip install pypdf")
+        reader = PdfReader(str(p))
+        return "\n".join((page.extract_text() or "") for page in reader.pages)
+    if ext == ".docx":
+        try:
+            import docx
+        except ImportError:
+            raise RuntimeError("读取 docx 需要 python-docx：pip install python-docx")
+        d = docx.Document(str(p))
+        lines = [para.text for para in d.paragraphs]
+        for table in d.tables:
+            for row in table.rows:
+                lines.append(" | ".join(cell.text for cell in row.cells))
+        return "\n".join(lines)
+    if ext == ".xlsx":
+        try:
+            import openpyxl
+        except ImportError:
+            raise RuntimeError("读取 xlsx 需要 openpyxl：pip install openpyxl")
+        wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+        out = []
+        try:
+            for ws in wb.worksheets:
+                out.append(f"# Sheet: {ws.title}")
+                for row in ws.iter_rows(values_only=True):
+                    cells = ["" if v is None else str(v) for v in row]
+                    if any(cells):
+                        out.append(" | ".join(cells))
+        finally:
+            wb.close()
+        return "\n".join(out)
+    # 其余类型按纯文本读取，自动尝试常见编码
+    for enc in ("utf-8", "gb18030", "latin-1"):
+        try:
+            return p.read_text(encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    return p.read_text(encoding="utf-8", errors="replace")
 
 
 def encode_image(path: str, max_edge: int = MAX_IMAGE_EDGE) -> str:

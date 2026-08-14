@@ -20,7 +20,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 echo [2/2] Installing package...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip >nul
-".venv\Scripts\python.exe" -m pip install -e .
+".venv\Scripts\python.exe" -m pip install -e ".[files]"
 if errorlevel 1 (
     echo [ERROR] pip install failed. Check network/proxy.
     pause
