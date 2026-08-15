@@ -76,6 +76,7 @@ class DB:
     # ---- messages ----
     def add_message(self, cid: int, role: str, content, hidden=0, summary=0, at: int | None = None) -> int:
         payload = json.dumps(content, ensure_ascii=False)
+        payload = "".join("\ufffd" if 0xD800 <= ord(c) <= 0xDFFF else c for c in payload)
         if at is not None:
             # 摘要插入：复用 at 位置那条消息的 id 原地改写成摘要，避免全局自增 id 冲突
             cur = self.conn.execute(

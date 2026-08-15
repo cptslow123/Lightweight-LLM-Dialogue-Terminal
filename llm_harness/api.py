@@ -103,8 +103,15 @@ def encode_image(path: str, max_edge: int = MAX_IMAGE_EDGE) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def clean_text(s: str) -> str:
+    """把孤立代理项等无法 UTF-8 编码的字符替换为 �。"""
+    if not s:
+        return s
+    return "".join("\ufffd" if 0xD800 <= ord(c) <= 0xDFFF else c for c in s)
+
+
 def parts_from_inputs(text: str, image_paths: list[str]) -> list:
-    parts = [{"type": "text", "text": text}] if text else []
+    parts = [{"type": "text", "text": clean_text(text)}] if text else []
     for p in image_paths:
         parts.append({"type": "image_url", "image_url": {"url": encode_image(p)}})
     return parts or [{"type": "text", "text": ""}]

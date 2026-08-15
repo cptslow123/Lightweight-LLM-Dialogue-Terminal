@@ -230,6 +230,7 @@ class App:
         self.conv = None
         self.sessions = []
         self.last_reasoning = ""
+        self._fold_ctx = None
 
     # ---- 状态 ----
     @property
@@ -386,7 +387,7 @@ class App:
                     text_parts.append(rest)
                 continue
             text_parts.append(term)
-        text = " ".join(text_parts).strip()
+        text = api.clean_text(" ".join(text_parts).strip())
         if not text and not images and not files:
             self.console.print("[dim](未识别到文字或附件路径)[/dim]")
             return
@@ -425,7 +426,7 @@ class App:
                 continue
             if len(content) > api.MAX_FILE_CHARS:
                 content = content[:api.MAX_FILE_CHARS] + "\n…（内容过长已截断）"
-            parts.append({"type": "text", "text": f"[附件: {Path(fp).name}]\n{content}"})
+            parts.append({"type": "text", "text": f"[附件: {Path(fp).name}]\n" + api.clean_text(content)})
         user_msg = api.Msg(role="user", parts=parts)
 
         async def do_round(include_user: bool):
@@ -504,6 +505,7 @@ class App:
         text, reasoning, usage, error = "", "", None, None
         interrupted = False
         self.last_reasoning = ""
+        self._fold_ctx = None
         t0 = time.perf_counter()
         pending = ""
         consumed = 0
@@ -669,6 +671,33 @@ class App:
             view.append(f"\n… 共 {total} 行，输入 /unfold 展开")
         return view
 
+    @staticmethod
+    def _clip_line(ln, width):
+        """按终端宽度安全截断（宽字符按显示宽度计），超长加省略号。"""
+        ln = ln.rstrip()
+        if cell_len(ln) <= width:
+            return ln
+        cut = 0
+        total = 0
+        for ch in ln:
+            w = cell_len(ch)
+            if total + w > width - 1:
+                break
+            total += w
+            cut += 1
+        return ln[:cut] + "…"
+
+    @staticmethod
+    def _fold_lines(reasoning, width):
+        """折叠视图的逐行文本（每行一行，配合原位折叠使用）。"""
+        lines = reasoning.splitlines()
+        total = len(lines)
+        shown = lines[-5:] if total > 5 else lines
+        out = [App._clip_line(ln, width) for ln in shown]
+        if total > 5:
+            out.append(f"… 共 {total} 行，输入 /unfold 展开")
+        return out
+
     def print_usage(self, stats, window, usage=None, reserve=0, max_input=0, elapsed=None):
         budget = min(window - reserve, max_input) if max_input else window - reserve
         line = f"[dim]tokens ≈ {stats['estimated']} / {budget}"
@@ -688,6 +717,9 @@ class App:
     def dispatch(self, line) -> bool:
         words = split_terms(line)
         cmd, args = words[0][1:].lower(), words[1:]
+        self._cmd_line = line
+        if cmd not in ("fold", "unfold"):
+            self._fold_ctx = None
         handler = getattr(self, f"cmd_{cmd}", None)
         if handler is None:
             self.console.print(f"[yellow]未知命令 /{cmd}，输入 /help 查看[/yellow]")
@@ -705,7 +737,7 @@ class App:
     cmd_exit = cmd_quit
 
     def cmd_new(self, args):
-        title = " ".join(args) or "untitled"
+        title = api.clean_text(" ".join(args)) or "untitled"
         cid = self.db.new_conversation(title=title, provider=self.provider_name, model=self.resolve_model(),
                                        thinking=self.resolve_thinking())
         self.conv = self.db.get_conversation(cid)
@@ -756,7 +788,7 @@ class App:
         cid = self._conv_id(args)
         if cid is None or len(args) < 2:
             return True
-        self.db.update_conversation(cid, title=" ".join(args[1:]))
+        self.db.update_conversation(cid, title=api.clean_text(" ".join(args[1:])))
         if self.conv["id"] == cid:
             self.conv = self.db.get_conversation(cid)
         self.refresh()
@@ -994,13 +1026,41 @@ class App:
         if not self.last_reasoning:
             self.console.print("[dim]本次没有思考链[/dim]")
             return True
-        self.console.print(Text(self.last_reasoning, style="dim"))
+        view = Text(self.last_reasoning, style="dim")
+        height = 0
+        if sys.stdout.isatty():
+            try:
+                height = len(self.console.render_lines(view))
+            except Exception:
+                height = 0
+        self.console.print(view)
+        self._fold_ctx = {"reasoning": self.last_reasoning, "height": height}
         return True
 
     def cmd_fold(self, args):
         if not self.last_reasoning:
             self.console.print("[dim]本次没有思考链[/dim]")
             return True
+        ctx = self._fold_ctx
+        if ctx and ctx.get("reasoning") == self.last_reasoning and ctx.get("height") and sys.stdout.isatty():
+            # 原位折叠：光标回到展开块起点，用折叠视图覆盖，再清掉下方多余行
+            try:
+                width = self.console.width or 80
+                rows = self._fold_lines(self.last_reasoning, width)
+                cmd_line = getattr(self, "_cmd_line", "/fold")
+                model = self.resolve_model()
+                sys.stdout.write(f"\x1b[{ctx['height']}F")
+                for ln in rows:
+                    sys.stdout.write(f"\x1b[2m{ln}\x1b[0m\n")
+                sys.stdout.write("\x1b[J")
+                sys.stdout.write(f"\x1b[94m{model}\x1b[0m > {cmd_line}\n")
+                sys.stdout.flush()
+            except Exception:
+                self.console.print(self.reasoning_view(self.last_reasoning))
+            finally:
+                self._fold_ctx = None
+            return True
+        self._fold_ctx = None
         self.console.print(self.reasoning_view(self.last_reasoning))
         return True
 
