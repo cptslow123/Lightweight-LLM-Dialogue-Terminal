@@ -174,8 +174,9 @@ class HarnessCompleter(Completer):
             elif first in ("switch", "load", "delete", "rename"):
                 for sid, title in self.app.sessions:
                     s = str(sid)
-                    if s.startswith(token) and s != token:
-                        yield Completion(s, start_position=-len(token), display=f"{s}  {title}")
+                    if (s.startswith(token) or title.startswith(token)) and s != token:
+                        label = title if first == "load" else f"{s}  {title}"
+                        yield Completion(s, start_position=-len(token), display=label)
             elif first == "attach":
                 yield from PathCompleter().get_completions(document, complete_event)
 
@@ -190,6 +191,7 @@ class App:
         self.cli_model = model
         self.cli_thinking = thinking
         self.conv = None
+        self.sessions = []
         self.last_reasoning = ""
 
     # ---- 状态 ----
@@ -254,6 +256,7 @@ class App:
 
     def run(self):
         self.load_session()
+        self.refresh()
         self.console.print(f"[bold]llm-harness v{__version__}[/bold]  模型 [cyan]{self.resolve_model()}[/cyan]  "
                            f"思考 [cyan]{self.resolve_thinking()}[/cyan]")
         self.console.print("[dim]输入 /help 查看命令 · 拖入或粘贴图片/文件路径即可发送 · Ctrl+C 清空当前输入 · Tab 补全[/dim]")
@@ -281,8 +284,25 @@ class App:
     def enable_cursor_blink():
         # 尝试启用光标闪烁（Windows Terminal 支持；旧 conhost 由系统设置控制）
         try:
-            sys.stdout.write("\x1b[?12h")
+            sys.stdout.write("\x1b[?12h\x1b[5 q")
             sys.stdout.flush()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _patch_blink():
+        # prompt_toolkit 每次渲染显示光标时发送 \x1b[?12l 会关闭闪烁，
+        # 覆盖掉 enable_cursor_blink() 的设置；这里去掉该序列以保持细线光标闪烁。
+        try:
+            from prompt_toolkit.output import vt100 as _vt
+            if getattr(_vt.Vt100_Output.show_cursor, "_lh_keep_blink", False):
+                return
+            def _show_cursor(self):
+                if self._cursor_visible in (False, None):
+                    self._cursor_visible = True
+                    self.write_raw("\x1b[?25h")
+            _show_cursor._lh_keep_blink = True
+            _vt.Vt100_Output.show_cursor = _show_cursor
         except Exception:
             pass
 
@@ -293,6 +313,7 @@ class App:
             try:
                 from prompt_toolkit import prompt
                 from prompt_toolkit.formatted_text import HTML
+                self._patch_blink()
                 return prompt(HTML(f"<ansibrightblue>{html.escape(model)}</ansibrightblue> > "),
                               completer=HarnessCompleter(self)).strip()
             except Exception:
@@ -645,10 +666,10 @@ class App:
             self.console.print("[dim]暂无会话[/dim]")
             return True
         table = Table(title="会话")
-        for col in ("id", "title", "model", "updated_at"):
+        for col in ("title", "model", "updated_at"):
             table.add_column(col)
         for r in rows:
-            table.add_row(str(r["id"]), r["title"][:30], r["model"], r["updated_at"][:16])
+            table.add_row(r["title"][:30], r["model"], r["updated_at"][:16])
         self.console.print(table)
         return True
 
@@ -732,7 +753,34 @@ class App:
         for m in rows:
             self.db.add_message(self.conv["id"], m["role"], json.loads(m["content"]))
         self.refresh()
-        self.console.print(f"[green]已载入 {len(rows)} 条消息[/green]")
+        self.console.print(f"[green]已载入 {len(rows)} 条消息，当前会话记录：[/green]")
+        self.render_history()
+        return True
+
+    def render_history(self):
+        """重绘当前会话的用户/助手消息（跳过 system 摘要与联网注入）。"""
+        shown = 0
+        for r in self.db.get_messages(self.conv["id"]):
+            role, content = r["role"], json.loads(r["content"])
+            if role == "system":
+                continue
+            text = "".join(p.get("text", "") for p in content if p.get("type") == "text").strip()
+            imgs = sum(1 for p in content if p.get("type") == "image_url")
+            if not text and not imgs:
+                continue
+            shown += 1
+            label = "你" if role == "user" else self.resolve_model()
+            self.console.print(f"[bold cyan]{label}:[/bold cyan]")
+            if imgs:
+                self.console.print(f"[dim](图片 {imgs} 张)[/dim]")
+            if text:
+                if role == "assistant":
+                    self.console.print(MarkdownWrap(text))
+                else:
+                    self.console.print(text)
+            self.console.print()
+        if not shown:
+            self.console.print("[dim]当前会话暂无消息[/dim]")
         return True
 
     def cmd_model(self, args):

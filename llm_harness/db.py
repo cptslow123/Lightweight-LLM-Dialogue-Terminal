@@ -75,18 +75,23 @@ class DB:
 
     # ---- messages ----
     def add_message(self, cid: int, role: str, content, hidden=0, summary=0, at: int | None = None) -> int:
-        row = (cid, role, json.dumps(content, ensure_ascii=False), hidden, summary, now())
+        payload = json.dumps(content, ensure_ascii=False)
         if at is not None:
-            self.conn.execute("UPDATE messages SET id=id+1 WHERE conversation_id=? AND id>=?", (cid, at))
-            self.conn.execute(
-                "INSERT INTO messages(id, conversation_id, role, content, hidden, summary, created_at) VALUES(?,?,?,?,?,?,?)",
-                (at, *row),
+            # 摘要插入：复用 at 位置那条消息的 id 原地改写成摘要，避免全局自增 id 冲突
+            cur = self.conn.execute(
+                "UPDATE messages SET role=?, content=?, hidden=?, summary=? WHERE conversation_id=? AND id=?",
+                (role, payload, hidden, summary, cid, at),
             )
+            if cur.rowcount == 0:
+                cur = self.conn.execute(
+                    "INSERT INTO messages(conversation_id, role, content, hidden, summary, created_at) VALUES(?,?,?,?,?,?)",
+                    (cid, role, payload, hidden, summary, now()),
+                )
             self.conn.commit()
             return at
         cur = self.conn.execute(
             "INSERT INTO messages(conversation_id, role, content, hidden, summary, created_at) VALUES(?,?,?,?,?,?)",
-            row,
+            (cid, role, payload, hidden, summary, now()),
         )
         self.conn.commit()
         return cur.lastrowid
