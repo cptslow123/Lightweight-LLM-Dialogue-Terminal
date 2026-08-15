@@ -4,6 +4,7 @@ import html
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -130,6 +131,42 @@ def split_terms(line: str) -> list:
             t = t[1:-1]
         out.append(t)
     return out
+
+def clipboard_paths() -> list:
+    """从 Windows 剪贴板取文件路径；剪贴板是图片时保存为临时 PNG 并返回其路径。"""
+    ps = r'''
+[Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+$d = [System.Windows.Forms.Clipboard]::GetFileDropList()
+if ($d -and $d.Count -gt 0) { $d | ForEach-Object { [string]$_ } | Where-Object { $_ }; exit 0 }
+if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
+    $img = [System.Windows.Forms.Clipboard]::GetImage()
+    $p = Join-Path $env:TEMP ("lh_paste_" + [guid]::NewGuid().ToString("N") + ".png")
+    $img.Save($p, [System.Drawing.Imaging.ImageFormat]::Png)
+    Write-Output $p
+    exit 0
+}
+exit 1
+'''
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command", ps],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def split_file_prefix(term: str):
+    """若 term 前部存在真实文件路径（如路径后紧跟文字没空格），返回 (路径, 剩余文本)。"""
+    for i in range(len(term), 0, -1):
+        if Path(term[:i]).is_file():
+            return term[:i], term[i:]
+    return None, term
+
 
 def classify_attachment(path: str):
     """返回 'image' / 'file' / None（不支持的扩展名按普通文本处理）。"""
@@ -259,7 +296,8 @@ class App:
         self.refresh()
         self.console.print(f"[bold]llm-harness v{__version__}[/bold]  模型 [cyan]{self.resolve_model()}[/cyan]  "
                            f"思考 [cyan]{self.resolve_thinking()}[/cyan]")
-        self.console.print("[dim]输入 /help 查看命令 · 拖入或粘贴图片/文件路径即可发送 · Ctrl+C 清空当前输入 · Tab 补全[/dim]")
+        paste_key = "Ctrl+V" if not os.environ.get("WT_SESSION") else "Shift+Insert"
+        self.console.print(f"[dim]输入 /help 查看命令 · 拖入或 {paste_key} 粘贴图片/文件即可发送 · Ctrl+C 清空当前输入 · Tab 补全[/dim]")
         while True:
             self.enable_cursor_blink()
             try:
@@ -313,25 +351,40 @@ class App:
             try:
                 from prompt_toolkit import prompt
                 from prompt_toolkit.formatted_text import HTML
+                from prompt_toolkit.key_binding import KeyBindings
                 self._patch_blink()
+                kb = KeyBindings()
+
+                @kb.add("c-v")
+                @kb.add("s-insert")
+                def _paste_clipboard(event):
+                    paths = clipboard_paths()
+                    if paths:
+                        event.current_buffer.insert_text(" ".join(paths) + " ")
+                    else:
+                        data = event.app.clipboard.get_data()
+                        if data.text:
+                            event.current_buffer.paste_clipboard_data(data)
+
                 return prompt(HTML(f"<ansibrightblue>{html.escape(model)}</ansibrightblue> > "),
-                              completer=HarnessCompleter(self)).strip()
-            except Exception:
+                              completer=HarnessCompleter(self), key_bindings=kb).strip()
+            except ImportError:
                 pass
+            except Exception as e:
+                self.console.print(f"[yellow]输入初始化失败，回退基础输入：{e}[/yellow]")
         return input(f"{model} > ").strip()
 
     # ---- 输入 ----
     def handle_input(self, line):
         images, files, text_parts = [], [], []
         for term in split_terms(line):
-            if Path(term).is_file():
-                kind = classify_attachment(term)
-                if kind == "image":
-                    images.append(term)
-                    continue
-                if kind == "file":
-                    files.append(term)
-                    continue
+            path, rest = split_file_prefix(term)
+            kind = classify_attachment(path) if path else None
+            if kind:
+                (images if kind == "image" else files).append(path)
+                if rest:
+                    text_parts.append(rest)
+                continue
             text_parts.append(term)
         text = " ".join(text_parts).strip()
         if not text and not images and not files:
