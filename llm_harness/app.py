@@ -118,7 +118,11 @@ def _cursor_up(console, rows: int):
 
 SEARCH_DIRECTIVE = """
 
-请直接基于以上搜索结果回答用户的问题，不要再输出 [SEARCH: ...]。如果搜索结果仍无法回答，请如实说明原因。"""
+请直接基于以上搜索结果回答用户的问题。严格禁止再次输出 [SEARCH: ...]，也不要再搜索——结果已足够。如果搜索结果仍无法回答，请如实说明原因。"""
+
+RETRY_DIRECTIVE = """
+
+你刚才再次输出了 [SEARCH: ...]，但搜索结果已经注入。请直接基于[网络搜索结果]回答用户的问题，绝对禁止再次输出 [SEARCH: ...]。如果搜索结果仍无法回答，请如实说明原因。"""
 
 # 按空白分词，保留引号内的空格并去掉引号（支持终端拖入带空格的文件路径）
 _PATH_TOKEN_RE = re.compile(r'"(?:[^"]*)"|\'(?:[^\']*)\'|\S+')
@@ -493,7 +497,15 @@ class App:
                 if assistant_text:
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
             elif m:
-                # 模型第二轮仍输出搜索标记：不保存标记，直接展示搜索结果兜底
+                if search_round < 3:
+                    # 模型仍输出搜索标记：追加纠正指令，再给一次直接作答的机会
+                    self.console.print("[dim]模型重复输出搜索标记，已提示其直接作答…[/dim]")
+                    self.db.add_message(self.conv["id"], "system",
+                                        [{"type": "text", "text": RETRY_DIRECTIVE}])
+                    self.refresh()
+                    send, stats = await do_round(include_user=False)
+                    continue
+                # 三轮仍输出搜索标记：不保存标记，直接展示搜索结果兜底
                 if last_context:
                     self.console.print("[yellow]模型未直接作答，已展示搜索结果：[/yellow]")
                     self.console.print(MarkdownWrap(last_context))
