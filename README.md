@@ -24,6 +24,7 @@ Copy-Item config.example.toml $env:USERPROFILE\.llm_harness\config.toml
 python -m llm_harness
 # 可选：--provider / --model / --think / --config
 ```
+每次启动优先复用现有空会话（untitled），没有空会话时自动新建（历史会话保留，可用 /list、/switch 找回）。
 
 ## 命令
 `/new` 新建 · `/list` 列表 · `/switch <id>` 切换 · `/rename` `/delete` `/clear`

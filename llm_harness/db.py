@@ -73,6 +73,14 @@ class DB:
     def latest_conversation(self):
         return self.conn.execute("SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 1").fetchone()
 
+    def latest_empty_conversation(self):
+        """最新的 untitled 且无消息的空会话（启动时优先复用）。"""
+        return self.conn.execute(
+            "SELECT * FROM conversations c WHERE c.title='untitled' AND NOT EXISTS "
+            "(SELECT 1 FROM messages m WHERE m.conversation_id=c.id) "
+            "ORDER BY c.updated_at DESC LIMIT 1"
+        ).fetchone()
+
     # ---- messages ----
     def add_message(self, cid: int, role: str, content, hidden=0, summary=0, at: int | None = None) -> int:
         payload = json.dumps(content, ensure_ascii=False)

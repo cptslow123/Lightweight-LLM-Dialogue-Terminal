@@ -278,8 +278,15 @@ class App:
         self.sessions = [(r["id"], r["title"]) for r in self.db.list_conversations(100)]
 
     # ---- 启动 ----
-    def load_session(self, cid=None):
-        conv = self.db.get_conversation(cid) if cid else self.db.latest_conversation()
+    def load_session(self, cid=None, new=False):
+        """恢复会话；new=True 时优先复用现有空会话（untitled），没有则新建。"""
+        conv = None
+        if cid:
+            conv = self.db.get_conversation(cid)
+        elif new:
+            conv = self.db.latest_empty_conversation()
+        else:
+            conv = self.db.latest_conversation()
         if conv is None:
             model = self.defaults.get("model", "")
             provider = next((p["name"] for p in self.providers if model in p.get("models", [])),
@@ -293,7 +300,7 @@ class App:
         self.conv = conv
 
     def run(self):
-        self.load_session()
+        self.load_session(new=True)
         self.refresh()
         self.console.print(f"[bold]llm-harness v{__version__}[/bold]  模型 [cyan]{self.resolve_model()}[/cyan]  "
                            f"思考 [cyan]{self.resolve_thinking()}[/cyan]")
