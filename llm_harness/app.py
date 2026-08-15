@@ -235,6 +235,7 @@ class App:
         self.sessions = []
         self.last_reasoning = ""
         self._fold_ctx = None
+        self._writeback_cid = None
 
     # ---- 状态 ----
     @property
@@ -284,6 +285,7 @@ class App:
     # ---- 启动 ----
     def load_session(self, cid=None, new=False):
         """恢复会话；new=True 时优先复用现有空会话（untitled），没有则新建。"""
+        self._writeback_cid = None
         conv = None
         if cid:
             conv = self.db.get_conversation(cid)
@@ -302,6 +304,36 @@ class App:
             )
             conv = self.db.get_conversation(cid)
         self.conv = conv
+
+    def writeback(self, role, parts):
+        """续写模式：把新增 user/assistant 消息实时追加到目标会话。"""
+        target = self._writeback_cid
+        if not target or role not in ("user", "assistant"):
+            return
+        try:
+            self.db.add_message(target, role, parts)
+        except Exception as e:
+            self.console.print(f"[yellow]写回会话 {target} 失败: {e}[/yellow]")
+
+    def _clear_writeback(self):
+        """退出续写模式：删除临时会话（消息已实时写回），并清空目标。"""
+        temp = self.conv["id"] if self._writeback_cid else None
+        self._writeback_cid = None
+        if temp is not None:
+            try:
+                self.db.delete_conversation(temp)
+            except Exception:
+                pass
+
+    def _finish_session(self):
+        """退出清理：续写模式下删除临时会话（目标会话保留）。"""
+        target = self._writeback_cid
+        if not target or target == self.conv["id"]:
+            return
+        try:
+            self.db.delete_conversation(self.conv["id"])
+        except Exception as e:
+            self.console.print(f"[yellow]清理临时会话失败: {e}[/yellow]")
 
     def run(self):
         self.load_session(new=True)
@@ -327,8 +359,8 @@ class App:
                     break
             else:
                 self.handle_input(line)
-        # 关闭会话：清空所有对话记录
-        self.db.wipe_all()
+        # 退出清理：续写模式下临时会话的消息已实时写回，删除临时会话本身
+        self._finish_session()
 
     @staticmethod
     def enable_cursor_blink():
@@ -453,9 +485,12 @@ class App:
 
         send, stats = await do_round(include_user=True)
         self.db.add_message(self.conv["id"], "user", user_msg.parts)
+        self.writeback("user", user_msg.parts)
         if self.conv["title"] == "untitled" and text:
             self.db.update_conversation(self.conv["id"], title=text[:30])
         self.db.update_conversation(self.conv["id"], provider=self.provider_name, model=model, thinking=thinking)
+        if self._writeback_cid:
+            self.db.update_conversation(self._writeback_cid, provider=self.provider_name, model=model, thinking=thinking)
         self.conv = self.db.get_conversation(self.conv["id"])
         self.refresh()
 
@@ -496,6 +531,7 @@ class App:
             if error:
                 if assistant_text:
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
+                    self.writeback("assistant", [{"type": "text", "text": assistant_text}])
             elif m:
                 if search_round < 3:
                     # 模型仍输出搜索标记：追加纠正指令，再给一次直接作答的机会
@@ -512,6 +548,7 @@ class App:
             else:
                 if assistant_text:
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
+                    self.writeback("assistant", [{"type": "text", "text": assistant_text}])
             break
         elapsed = time.perf_counter() - t0
         self.print_usage(stats, window, usage, max_tokens, max_input, elapsed)
@@ -756,6 +793,7 @@ class App:
     cmd_exit = cmd_quit
 
     def cmd_new(self, args):
+        self._clear_writeback()
         title = api.clean_text(" ".join(args)) or "untitled"
         cid = self.db.new_conversation(title=title, provider=self.provider_name, model=self.resolve_model(),
                                        thinking=self.resolve_thinking())
@@ -798,6 +836,7 @@ class App:
         if not conv:
             self.console.print("[red]会话不存在[/red]")
             return True
+        self._clear_writeback()
         self.conv = conv
         self.refresh()
         self.console.print(f"[green]已切换: 「{conv['title']}」[/green]")
@@ -818,6 +857,8 @@ class App:
         cid = self._conv_id(args)
         if cid is None:
             return True
+        if cid == self._writeback_cid:
+            self._writeback_cid = None
         self.db.delete_conversation(cid)
         if self.conv["id"] == cid:
             self.load_session()
@@ -836,6 +877,7 @@ class App:
                                        model=self.conv["model"], thinking=self.conv["thinking"])
         for m in self.db.get_messages(self.conv["id"], include_hidden=True):
             self.db.add_message(cid, m["role"], json.loads(m["content"]), m["hidden"], m["summary"])
+        self._clear_writeback()
         self.conv = self.db.get_conversation(cid)
         self.refresh()
         self.console.print("[green]已分支到新会话[/green]")
@@ -844,6 +886,9 @@ class App:
     def cmd_load(self, args):
         cid = self._conv_id(args)
         if cid is None:
+            return True
+        if cid == self.conv["id"]:
+            self.console.print("[yellow]不能载入当前会话自身[/yellow]")
             return True
         n = None
         if len(args) > 1:
@@ -856,8 +901,10 @@ class App:
             rows = rows[-n:]
         for m in rows:
             self.db.add_message(self.conv["id"], m["role"], json.loads(m["content"]))
+        self._writeback_cid = cid
         self.refresh()
         self.console.print(f"[green]已载入 {len(rows)} 条消息，当前会话记录：[/green]")
+        self.console.print(f"[dim]续写会话 {cid} 中[/dim]")
         self.render_history()
         return True
 
