@@ -28,7 +28,7 @@ python -m llm_harness
 
 ## 命令
 `/new` 新建 · `/list` 列表 · `/switch <id>` 切换 · `/rename` `/delete` `/clear`
-`/fork` 分支 · `/load <id> [N]` 拼接历史并续写（之后新消息实时写回该会话，退出自动清理临时会话） · `/model` `/think` 切换
+`/fork` 分支 · `/load <id> [N]` 直接载入该会话继续对话（新消息追加到原会话，`N` 可只显示最近 N 条） · `/model` `/think` 切换
 `/attach <路径>` 或直接把文件拖入终端发送 · `/compress` 手动压缩 · `/usage` 占用
 `/setting` 新窗口配置向导 · `/reload` 重载配置
 

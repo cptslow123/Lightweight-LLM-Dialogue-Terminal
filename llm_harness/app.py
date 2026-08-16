@@ -48,7 +48,7 @@ HELP_TEXT = """\
   /delete <id>          删除会话
   /clear                清空当前会话消息
   /fork [标题]          复制当前会话为分支
-  /load <id> [N]        把另一会话最近 N 条插入当前上下文
+  /load <id> [N]        载入另一会话继续对话（可只显示最近 N 条）
   /model <名称>         切换模型（Tab 补全）
   /think <off|low|medium|high>  思考档位
   /attach <路径...>     发送图片/文件（也可直接拖入终端）
@@ -235,7 +235,6 @@ class App:
         self.sessions = []
         self.last_reasoning = ""
         self._fold_ctx = None
-        self._writeback_cid = None
 
     # ---- 状态 ----
     @property
@@ -282,10 +281,15 @@ class App:
     def refresh(self):
         self.sessions = [(r["id"], r["title"]) for r in self.db.list_conversations(100)]
 
+    def _show_header(self, title=None):
+        """在界面头部显示当前会话标题与模型信息。"""
+        t = title or (self.conv["title"] if self.conv else "untitled")
+        self.console.print(f"[bold]llm-harness v{__version__}[/bold]  会话 [cyan]{t}[/cyan]  "
+                           f"模型 [cyan]{self.resolve_model()}[/cyan]  思考 [cyan]{self.resolve_thinking()}[/cyan]")
+
     # ---- 启动 ----
     def load_session(self, cid=None, new=False):
         """恢复会话；new=True 时优先复用现有空会话（untitled），没有则新建。"""
-        self._writeback_cid = None
         conv = None
         if cid:
             conv = self.db.get_conversation(cid)
@@ -305,41 +309,10 @@ class App:
             conv = self.db.get_conversation(cid)
         self.conv = conv
 
-    def writeback(self, role, parts):
-        """续写模式：把新增 user/assistant 消息实时追加到目标会话。"""
-        target = self._writeback_cid
-        if not target or role not in ("user", "assistant"):
-            return
-        try:
-            self.db.add_message(target, role, parts)
-        except Exception as e:
-            self.console.print(f"[yellow]写回会话 {target} 失败: {e}[/yellow]")
-
-    def _clear_writeback(self):
-        """退出续写模式：删除临时会话（消息已实时写回），并清空目标。"""
-        temp = self.conv["id"] if self._writeback_cid else None
-        self._writeback_cid = None
-        if temp is not None:
-            try:
-                self.db.delete_conversation(temp)
-            except Exception:
-                pass
-
-    def _finish_session(self):
-        """退出清理：续写模式下删除临时会话（目标会话保留）。"""
-        target = self._writeback_cid
-        if not target or target == self.conv["id"]:
-            return
-        try:
-            self.db.delete_conversation(self.conv["id"])
-        except Exception as e:
-            self.console.print(f"[yellow]清理临时会话失败: {e}[/yellow]")
-
     def run(self):
         self.load_session(new=True)
         self.refresh()
-        self.console.print(f"[bold]llm-harness v{__version__}[/bold]  模型 [cyan]{self.resolve_model()}[/cyan]  "
-                           f"思考 [cyan]{self.resolve_thinking()}[/cyan]")
+        self._show_header()
         paste_key = "Ctrl+V" if not os.environ.get("WT_SESSION") else "Shift+Insert"
         self.console.print(f"[dim]输入 /help 查看命令 · 拖入或 {paste_key} 粘贴图片/文件即可发送 · Ctrl+C 清空当前输入 · Tab 补全[/dim]")
         while True:
@@ -359,9 +332,6 @@ class App:
                     break
             else:
                 self.handle_input(line)
-        # 退出清理：续写模式下临时会话的消息已实时写回，删除临时会话本身
-        self._finish_session()
-
     @staticmethod
     def enable_cursor_blink():
         # 尝试启用光标闪烁（Windows Terminal 支持；旧 conhost 由系统设置控制）
@@ -485,12 +455,9 @@ class App:
 
         send, stats = await do_round(include_user=True)
         self.db.add_message(self.conv["id"], "user", user_msg.parts)
-        self.writeback("user", user_msg.parts)
         if self.conv["title"] == "untitled" and text:
             self.db.update_conversation(self.conv["id"], title=text[:30])
         self.db.update_conversation(self.conv["id"], provider=self.provider_name, model=model, thinking=thinking)
-        if self._writeback_cid:
-            self.db.update_conversation(self._writeback_cid, provider=self.provider_name, model=model, thinking=thinking)
         self.conv = self.db.get_conversation(self.conv["id"])
         self.refresh()
 
@@ -531,7 +498,6 @@ class App:
             if error:
                 if assistant_text:
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
-                    self.writeback("assistant", [{"type": "text", "text": assistant_text}])
             elif m:
                 if search_round < 3:
                     # 模型仍输出搜索标记：追加纠正指令，再给一次直接作答的机会
@@ -548,7 +514,6 @@ class App:
             else:
                 if assistant_text:
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
-                    self.writeback("assistant", [{"type": "text", "text": assistant_text}])
             break
         elapsed = time.perf_counter() - t0
         self.print_usage(stats, window, usage, max_tokens, max_input, elapsed)
@@ -787,18 +752,17 @@ class App:
         return True
 
     def cmd_quit(self, args):
-        self.console.print("[dim]再见[/dim]")
         return False
 
     cmd_exit = cmd_quit
 
     def cmd_new(self, args):
-        self._clear_writeback()
         title = api.clean_text(" ".join(args)) or "untitled"
         cid = self.db.new_conversation(title=title, provider=self.provider_name, model=self.resolve_model(),
                                        thinking=self.resolve_thinking())
         self.conv = self.db.get_conversation(cid)
         self.refresh()
+        self._show_header()
         self.console.print("[green]已新建会话[/green]")
         return True
 
@@ -836,9 +800,9 @@ class App:
         if not conv:
             self.console.print("[red]会话不存在[/red]")
             return True
-        self._clear_writeback()
         self.conv = conv
         self.refresh()
+        self._show_header()
         self.console.print(f"[green]已切换: 「{conv['title']}」[/green]")
         return True
 
@@ -857,8 +821,6 @@ class App:
         cid = self._conv_id(args)
         if cid is None:
             return True
-        if cid == self._writeback_cid:
-            self._writeback_cid = None
         self.db.delete_conversation(cid)
         if self.conv["id"] == cid:
             self.load_session()
@@ -877,9 +839,9 @@ class App:
                                        model=self.conv["model"], thinking=self.conv["thinking"])
         for m in self.db.get_messages(self.conv["id"], include_hidden=True):
             self.db.add_message(cid, m["role"], json.loads(m["content"]), m["hidden"], m["summary"])
-        self._clear_writeback()
         self.conv = self.db.get_conversation(cid)
         self.refresh()
+        self._show_header()
         self.console.print("[green]已分支到新会话[/green]")
         return True
 
@@ -888,7 +850,7 @@ class App:
         if cid is None:
             return True
         if cid == self.conv["id"]:
-            self.console.print("[yellow]不能载入当前会话自身[/yellow]")
+            self.console.print("[yellow]已在当前会话[/yellow]")
             return True
         n = None
         if len(args) > 1:
@@ -896,22 +858,24 @@ class App:
                 n = int(args[1])
             except ValueError:
                 pass
-        rows = self.db.get_messages(cid)
-        if n:
-            rows = rows[-n:]
-        for m in rows:
-            self.db.add_message(self.conv["id"], m["role"], json.loads(m["content"]))
-        self._writeback_cid = cid
+        conv = self.db.get_conversation(cid)
+        if not conv:
+            self.console.print("[red]会话不存在[/red]")
+            return True
+        self.conv = conv
         self.refresh()
-        self.console.print(f"[green]已载入 {len(rows)} 条消息，当前会话记录：[/green]")
-        self.console.print(f"[dim]续写会话 {cid} 中[/dim]")
-        self.render_history()
+        self._show_header()
+        self.console.print(f"[green]已载入会话：{conv['title']}[/green]")
+        self.render_history(limit=n)
         return True
 
-    def render_history(self):
+    def render_history(self, limit=None):
         """重绘当前会话的用户/助手消息（跳过 system 摘要与联网注入）。"""
         shown = 0
-        for r in self.db.get_messages(self.conv["id"]):
+        rows = self.db.get_messages(self.conv["id"])
+        if limit:
+            rows = rows[-limit:]
+        for r in rows:
             role, content = r["role"], json.loads(r["content"])
             if role == "system":
                 continue
