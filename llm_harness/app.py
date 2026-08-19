@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rich.cells import cell_len
@@ -116,13 +116,21 @@ def _cursor_up(console, rows: int):
         pass
 
 
-SEARCH_DIRECTIVE = """
-
-请直接基于以上搜索结果回答用户的问题。严格禁止再次输出 [SEARCH: ...]，也不要再搜索——结果已足够。如果搜索结果仍无法回答，请如实说明原因。"""
-
-RETRY_DIRECTIVE = """
-
-你刚才再次输出了 [SEARCH: ...]，但搜索结果已经注入。请直接基于[网络搜索结果]回答用户的问题，绝对禁止再次输出 [SEARCH: ...]。如果搜索结果仍无法回答，请如实说明原因。"""
+def answer_mode_prompt(searches_left: int) -> str:
+    if searches_left:
+        return (
+            "\n\n[联网搜索结果已注入]\n"
+            "请直接基于已注入的搜索结果分析并回答用户问题，给出明确结论和必要来源。\n"
+            "仅当现有资料确实不足以回答时，才可在第一行只输出 [SEARCH: 新的搜索关键词] 并停止；"
+            f"新关键词必须与此前搜索不同，最多还可搜索 {searches_left} 次。\n"
+            "资料足够时严禁输出 [SEARCH: ...]，请直接作答。"
+        )
+    return (
+        "\n\n[联网搜索已完成]\n"
+        "请直接基于已注入的搜索结果分析并回答用户问题，给出明确结论和必要来源。\n"
+        "搜索次数已达上限，严格禁止输出 [SEARCH: ...] 或要求继续搜索；"
+        "若资料仍不足，请明确说明缺少的信息。"
+    )
 
 # 按空白分词，保留引号内的空格并去掉引号（支持终端拖入带空格的文件路径）
 _PATH_TOKEN_RE = re.compile(r'"(?:[^"]*)"|\'(?:[^\']*)\'|\S+')
@@ -415,9 +423,15 @@ class App:
         cfg = self.provider_cfg()
         model = self.resolve_model()
         thinking = self.resolve_thinking()
-        system_prompt = conv["system_prompt"] or self.defaults.get("system_prompt", "You are a helpful assistant.")
-        system_prompt += f"\n当前日期：{datetime.now().year}年{datetime.now().month}月{datetime.now().day}日"
-        system_prompt += AUTO_SEARCH_PROMPT
+        base_system_prompt = conv["system_prompt"] or self.defaults.get("system_prompt", "You are a helpful assistant.")
+        now = datetime.now(timezone(timedelta(hours=8)))
+        weekdays = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+        base_system_prompt += (
+            f"\n当前时间（Asia/Shanghai）：{now.year}年{now.month}月{now.day}日，{weekdays[now.weekday()]}。"
+            "历史消息中的日期、星期和‘今天’、‘明天’等相对时间可能已过期；"
+            "回答当前日期或相对日期时，必须以当前时间为准。"
+        )
+        search_system_prompt = base_system_prompt + AUTO_SEARCH_PROMPT
         window = int(self.defaults.get("context_window", 8000))
         threshold = float(self.defaults.get("compress_threshold", 0.75))
         keep_last = int(self.defaults.get("compress_keep_last", 20))
@@ -442,9 +456,9 @@ class App:
             parts.append({"type": "text", "text": f"[附件: {Path(fp).name}]\n" + api.clean_text(content)})
         user_msg = api.Msg(role="user", parts=parts)
 
-        async def do_round(include_user: bool):
+        async def do_round(include_user: bool, active_system_prompt: str):
             msgs = self.load_msgs() + ([user_msg] if include_user else [])
-            send_msgs, stats = await ctx.prepare(msgs, system_prompt, cfg, model, window, threshold, keep_last,
+            send_msgs, stats = await ctx.prepare(msgs, active_system_prompt, cfg, model, window, threshold, keep_last,
                                                  reserve=max_tokens, max_input=max_input)
             for at_id, _, ids in stats["summaries"]:
                 self.db.mark_hidden(self.conv["id"], ids)
@@ -453,7 +467,7 @@ class App:
                                     [{"type": "text", "text": "[早期对话摘要] " + sum_text}], summary=1, at=at_id)
             return send_msgs, stats
 
-        send, stats = await do_round(include_user=True)
+        send, stats = await do_round(include_user=True, active_system_prompt=search_system_prompt)
         self.db.add_message(self.conv["id"], "user", user_msg.parts)
         if self.conv["title"] == "untitled" and text:
             self.db.update_conversation(self.conv["id"], title=text[:30])
@@ -462,15 +476,23 @@ class App:
         self.refresh()
 
         t0 = time.perf_counter()
-        search_round = 0
-        last_context = ""
+        max_searches = 3
+        search_count = 0
+        seen_queries = set()
+        active_system_prompt = search_system_prompt
         while True:
-            search_round += 1
             assistant_text, reasoning, usage, error = await self.stream_render(cfg, model, send, thinking, max_tokens)
             m = SEARCH_RE.match(assistant_text) if assistant_text and not error else None
-            if m and search_round < 2:
-                # 搜索标记轮：静默联网，不打印思考链/标记，只留一行过渡提示
+            if m and search_count < max_searches:
                 query = m.group(1).strip()
+                query_key = " ".join(query.lower().split())
+                if query_key in seen_queries:
+                    self.console.print("[dim]搜索关键词重复，已要求模型基于现有结果直接作答…[/dim]")
+                    search_count = max_searches
+                    active_system_prompt = base_system_prompt + answer_mode_prompt(0)
+                    send, stats = await do_round(include_user=False, active_system_prompt=active_system_prompt)
+                    continue
+                # 搜索标记轮：静默联网，不打印思考链/标记，只留一行过渡提示
                 self.console.print(f"[dim]已联网搜索: {query}[/dim]")
                 try:
                     results = web.web_search(query, 5, self.tavily_key())
@@ -480,6 +502,8 @@ class App:
                 if not results:
                     self.console.print("[red]没有搜索结果[/red]")
                     break
+                seen_queries.add(query_key)
+                search_count += 1
                 lines = [f"[网络搜索结果] 查询: {query}"]
                 for i, r in enumerate(results, 1):
                     lines.append(f"\n{i}. {r.get('title', '')}")
@@ -489,28 +513,17 @@ class App:
                     if r.get("href"):
                         lines.append(f"   来源: {r['href']}")
                 results_text = "\n".join(lines)
-                last_context = results_text
                 self.db.add_message(self.conv["id"], "system",
-                                    [{"type": "text", "text": results_text + SEARCH_DIRECTIVE}])
+                                    [{"type": "text", "text": results_text}])
                 self.refresh()
-                send, stats = await do_round(include_user=False)
+                active_system_prompt = base_system_prompt + answer_mode_prompt(max_searches - search_count)
+                send, stats = await do_round(include_user=False, active_system_prompt=active_system_prompt)
                 continue
             if error:
                 if assistant_text:
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
             elif m:
-                if search_round < 3:
-                    # 模型仍输出搜索标记：追加纠正指令，再给一次直接作答的机会
-                    self.console.print("[dim]模型重复输出搜索标记，已提示其直接作答…[/dim]")
-                    self.db.add_message(self.conv["id"], "system",
-                                        [{"type": "text", "text": RETRY_DIRECTIVE}])
-                    self.refresh()
-                    send, stats = await do_round(include_user=False)
-                    continue
-                # 三轮仍输出搜索标记：不保存标记，直接展示搜索结果兜底
-                if last_context:
-                    self.console.print("[yellow]模型未直接作答，已展示搜索结果：[/yellow]")
-                    self.console.print(MarkdownWrap(last_context))
+                self.console.print("[yellow]已完成 3 轮搜索，但模型未能基于结果生成回答。请切换模型后重试，或使用 /web 查看原始结果。[/yellow]")
             else:
                 if assistant_text:
                     self.db.add_message(self.conv["id"], "assistant", [{"type": "text", "text": assistant_text}])
