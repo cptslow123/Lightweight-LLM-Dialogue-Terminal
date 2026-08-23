@@ -18,8 +18,13 @@ from llm_harness.app import AUTO_SEARCH_PROMPT, SEARCH_RE, answer_mode_prompt  #
 from llm_harness.db import DB  # noqa: E402
 from llm_harness.settings import dump_toml  # noqa: E402
 
-# 开发模式数据保存在 GUI 的 data 目录；便携版由 Tauri 显式传入 EXE 同级目录。
-APP_DIR = Path(os.environ.get("LIGHT_HARNESS_DATA_DIR", Path(__file__).resolve().parent / "data"))
+# 开发模式数据保存在 GUI 的 data 目录；便携版优先使用 EXE 同级目录，
+# 即使 backend.exe 被直接双击启动，也不会把配置读进 PyInstaller 临时目录。
+if getattr(sys, "frozen", False):
+    DEFAULT_DATA_DIR = Path(sys.executable).resolve().parent
+else:
+    DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
+APP_DIR = Path(os.environ.get("LIGHT_HARNESS_DATA_DIR", DEFAULT_DATA_DIR))
 APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = APP_DIR / "config.toml"
 DB_PATH = APP_DIR / "chat.db"
