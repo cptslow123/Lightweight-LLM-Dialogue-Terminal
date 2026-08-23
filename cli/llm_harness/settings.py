@@ -92,6 +92,8 @@ def main(argv=None) -> None:
     defaults["context_window"] = int(ask("上下文窗口 context_window", str(defaults.get("context_window", 262144))) or 262144)
     defaults["max_input"] = int(ask("最大输入 max_input", str(defaults.get("max_input", 10000))) or 10000)
     defaults["max_tokens"] = int(ask("默认输出上限 max_tokens", str(defaults.get("max_tokens", 20000))) or 20000)
+    defaults["search_provider"] = ask("联网搜索 provider（firecrawl/tavily）", defaults.get("search_provider", "firecrawl"))
+    defaults["firecrawl_api_key"] = ask("Firecrawl API key（联网搜索）", defaults.get("firecrawl_api_key", ""))
     defaults["tavily_api_key"] = ask("Tavily API key（联网搜索）", defaults.get("tavily_api_key", ""))
 
     path.parent.mkdir(parents=True, exist_ok=True)

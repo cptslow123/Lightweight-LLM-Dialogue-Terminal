@@ -1,0 +1,1 @@
+{"productName":"Light Harness","version":"0.1.0","identifier":"com.light.harness","build":{"beforeDevCommand":"npm run dev","devUrl":"http://localhost:1420","frontendDist":"../dist"},"app":{"windows":[{"title":"Light Harness","width":1180,"height":680,"x":120,"y":60,"minWidth":840,"minHeight":520,"resizable":true}],"security":{"csp":null}},"bundle":{"active":false}}

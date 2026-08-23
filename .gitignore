@@ -48,3 +48,11 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.bak
+
+# GUI build output and local GUI data
+gui/node_modules/
+gui/data/
+gui/release/
+gui/dist/
+gui/build/
+gui/src-tauri/target/

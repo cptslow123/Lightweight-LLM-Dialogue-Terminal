@@ -1,0 +1,10 @@
+[defaults]
+provider = ""
+model = ""
+thinking = "off"
+max_tokens = 4096
+search_provider = "firecrawl"
+firecrawl_api_key = ""
+system_prompt = "You are a helpful, friendly AI assistant. 回答一律使用中文（除非用户明确要求其他语言）。"
+
+# 请在 GUI 设置中填写你的 OpenAI 兼容 Provider、base_url、API key 和模型。
