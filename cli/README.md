@@ -69,7 +69,7 @@ start_web.bat                    # 默认 0.0.0.0:8765，读取 ~/.llm_harness/c
 ### 联网搜索
 - 默认使用 Firecrawl：在 `~/.llm_harness/config.toml` 的 `[defaults]` 里填 `firecrawl_api_key = "fc-..."`，或设置环境变量 `FIRECRAWL_API_KEY`；未填 key 时 Firecrawl 仍提供限免额度。
 - 输入框旁的「搜索」按钮：手动用 Firecrawl 搜索输入内容，结果注入上下文。
-- 顶部「联网」开关：开启后模型判断需要实时信息时会输出 `[SEARCH: 关键词]`，后端自动搜索并续答（最多 3 轮）。
+- 顶部「联网」开关：开启后除简单逻辑、基础计算和纯常识外，模型会先输出 `[SEARCH: 关键词]`，后端自动搜索并续答（最多 5 轮）。
 - 换用 Tavily：把 `search_provider` 改为 `"tavily"` 并填 `tavily_api_key`。
 
 ### 安全提示

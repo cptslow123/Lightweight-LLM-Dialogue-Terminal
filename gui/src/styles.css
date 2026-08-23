@@ -278,6 +278,11 @@ button {
   margin: 8px 0 0;
   color: #67717d;
 }
+.generation-status {
+  margin: 10px 0 0 42px;
+  color: #7a8490;
+  font-size: 12px;
+}
 .copy-answer {
   position: absolute;
   left: 42px;
@@ -319,6 +324,13 @@ button {
   align-items: center;
   gap: 7px;
 }
+.attachment-input { display: none; }
+.attachment-list { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 8px; }
+.attachment-chip { display: flex; align-items: center; gap: 6px; max-width: 220px; padding: 5px 7px; background: #f1f4f7; border: 1px solid #dce2e8; border-radius: 6px; font-size: 12px; color: #5d6672; }
+.attachment-chip img { width: 32px; height: 32px; flex: 0 0 32px; object-fit: cover; border-radius: 4px; }
+.attachment-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-chip button { margin-left: auto; padding: 0 1px; color: #7e8791; font-size: 17px; line-height: 1; }
+.attachment-chip button:hover { color: #b42318; }
 .search-toggle {
   display: flex;
   align-items: center;

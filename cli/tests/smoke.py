@@ -42,10 +42,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         msgs = body.get("messages", [])
         user_text = next((self._msg_text(m) for m in msgs if m.get("role") == "user"), "")
-        if "三轮搜索" in user_text:
+        if "五轮搜索" in user_text:
             self.server.search_req = getattr(self.server, "search_req", 0) + 1
-            searches = ["[SEARCH: 第一组关键词]", "[SEARCH: 第二组关键词]", "[SEARCH: 第三组关键词]"]
-            text = searches[self.server.search_req - 1] if self.server.search_req <= 3 else "这是最终直接回答。"
+            searches = ["[SEARCH: 第一组关键词]", "[SEARCH: 第二组关键词]", "[SEARCH: 第三组关键词]", "[SEARCH: 第四组关键词]", "[SEARCH: 第五组关键词]"]
+            text = searches[self.server.search_req - 1] if self.server.search_req <= 5 else "这是最终直接回答。"
         elif "压缩" in self._msg_text(msgs[0]):
             text = SUMMARY_TEXT
         else:
@@ -167,17 +167,17 @@ def main():
     check("有消息的 untitled 不再复用", app3.conv["id"] != first_id)
     db3.close()
 
-    # 9) 搜索资料不足时可用不同关键词补搜，最多 3 轮后直接作答
+    # 9) 搜索资料不足时可用不同关键词补搜，最多 5 轮后直接作答
     cfg9 = {"defaults": {"model": "mock", "context_window": 8192}, "providers": cfg["providers"]}
     db4 = DB(tmp / "retry.db")
     app4 = App(cfg9, db4, console=console)
     app4.load_session(new=True)
     fake_results = [{"title": "测试标题", "body": "测试正文", "href": "http://example.com"}]
     with mock.patch("llm_harness.web.web_search", return_value=fake_results) as search:
-        asyncio.run(app4.send("三轮搜索测试", []))
+        asyncio.run(app4.send("五轮搜索测试", []))
     last_text = "".join(p.get("text", "") for p in json.loads(db4.get_messages(app4.conv["id"])[-1]["content"]))
-    check("最多执行三轮不同关键词搜索", search.call_count == 3)
-    check("三轮搜索后直接作答", "这是最终直接回答" in last_text)
+    check("最多执行五轮不同关键词搜索", search.call_count == 5)
+    check("五轮搜索后直接作答", "这是最终直接回答" in last_text)
     db4.close()
 
     # 10) /load 续写：新消息实时写回目标会话，退出时删除临时会话

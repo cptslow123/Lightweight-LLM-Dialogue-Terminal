@@ -12,7 +12,7 @@ max_tokens = 25000               # 单次输出 token 上限
 search_provider = "firecrawl"    # 联网搜索：firecrawl | tavily
 firecrawl_api_key = ""           # Firecrawl 联网搜索 key（https://firecrawl.dev 获取）
 tavily_api_key = ""              # Tavily 备用搜索 key（https://tavily.com 获取）
-system_prompt = "You are a helpful, friendly AI assistant. 回答一律使用中文（除非用户明确要求其他语言）。回答要准确、直接、友好。你默认倾向联网搜索：任何时效性、事实性或可能变化的信息，都优先联网核实最新资料，不要凭记忆猜测或编造。"
+system_prompt = "You are a helpful, friendly AI assistant. 回答一律使用中文（除非用户明确要求其他语言）。回答要准确、直接、友好。对于需要外部事实支撑的问题，优先联网核实并基于可靠来源作答；不要凭记忆猜测或编造。"
 
 # 多供应商配置：同 URL 不同模型可放同一 provider
 [[providers]]

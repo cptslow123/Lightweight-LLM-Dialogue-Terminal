@@ -24,6 +24,7 @@ type Conversation = {
   thinking: string;
 };
 type Message = { id?: number; role: string; content: string };
+type Attachment = { id: string; name: string; kind: "image" | "text" | "binary"; size: number; preview?: string; data_url?: string; text?: string; base64?: string };
 type Config = {
   defaults: Record<string, string | number | boolean>;
   providers: ProviderConfig[];
@@ -52,6 +53,24 @@ async function readJson(response: Response) {
   } catch {
     throw new Error("本地服务返回了无效数据：" + body.slice(0, 120));
   }
+}
+
+function readFile(file: File, mode: "dataUrl" | "base64"): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("读取附件失败：" + file.name));
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      resolve(mode === "base64" ? result.split(",", 2)[1] || "" : result);
+    };
+    if (mode === "base64") reader.readAsDataURL(file);
+    else reader.readAsDataURL(file);
+  });
+}
+
+function formatElapsed(milliseconds: number) {
+  const seconds = Math.floor(milliseconds / 1000);
+  return seconds < 60 ? seconds + " 秒" : Math.floor(seconds / 60) + " 分 " + seconds % 60 + " 秒";
 }
 
 async function loadConfigWithRetry() {
@@ -90,8 +109,41 @@ function App() {
   const [error, setError] = useState("");
   const [searching, setSearching] = useState("");
   const [reasoning, setReasoning] = useState("");
+  const [elapsed, setElapsed] = useState(0);
+  const [reasoningStartedAt, setReasoningStartedAt] = useState<number>();
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
   const endRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<AbortController>();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentCounter = useRef(0);
+  const generationStartedAt = useRef(0);
+  useEffect(() => {
+    if (!streaming) return;
+    const timer = window.setInterval(() => setElapsed(Date.now() - generationStartedAt.current), 250);
+    return () => window.clearInterval(timer);
+  }, [streaming]);
+  const addFiles = async (files: File[]) => {
+    const valid = files.filter((file) => file.size <= 20 * 1024 * 1024);
+    const rejected = files.filter((file) => file.size > 20 * 1024 * 1024);
+    if (rejected.length) setError("以下文件超过 20 MB：" + rejected.map((file) => file.name).join("、"));
+    const next = await Promise.all(valid.map(async (file): Promise<Attachment> => {
+      const id = String(++attachmentCounter.current);
+      if (file.type.startsWith("image/")) {
+        return { id, name: file.name || "粘贴图片.png", kind: "image", size: file.size, preview: URL.createObjectURL(file), data_url: await readFile(file, "dataUrl") };
+      }
+      const extension = file.name.split(".").pop()?.toLowerCase() || "";
+      if (["pdf", "docx", "xlsx"].includes(extension)) {
+        return { id, name: file.name, kind: "binary", size: file.size, base64: await readFile(file, "base64") };
+      }
+      return { id, name: file.name, kind: "text", size: file.size, text: await file.text() };
+    }));
+    setAttachments((old) => old.concat(next));
+  };
+  const removeAttachment = (id: string) => setAttachments((old) => {
+    const attachment = old.find((item) => item.id === id);
+    if (attachment?.preview) URL.revokeObjectURL(attachment.preview);
+    return old.filter((item) => item.id !== id);
+  });
   const selectModel = (value: string) => {
     const [nextProvider, ...modelParts] = value.split("::");
     setProvider(nextProvider);
@@ -177,15 +229,20 @@ function App() {
   }
   async function send() {
     const content = input.trim();
-    if (!content || streaming) return;
+    if ((!content && !attachments.length) || streaming) return;
+    const outgoingAttachments = attachments;
     setInput("");
+    setAttachments([]);
     setStreaming(true);
     setError("");
     setSearching("");
     setReasoning("");
+    setReasoningStartedAt(undefined);
+    generationStartedAt.current = Date.now();
+    setElapsed(0);
     setMessages((old) =>
       old.concat([
-        { role: "user", content },
+        { role: "user", content: [content, ...outgoingAttachments.map((item) => "[" + (item.kind === "image" ? "图片" : "文件") + "：" + item.name + "]")].filter(Boolean).join("\n") },
         { role: "assistant", content: "" },
       ]),
     );
@@ -202,6 +259,7 @@ function App() {
           model,
           thinking,
           search,
+          attachments: outgoingAttachments.map(({ id: _id, preview: _preview, size: _size, ...item }) => item),
         }),
       });
       if (!response.ok || !response.body)
@@ -228,7 +286,10 @@ function App() {
               };
               return copy;
             });
-          if (event.type === "reasoning") setReasoning(event.text);
+          if (event.type === "reasoning") {
+            setReasoning(event.text);
+            setReasoningStartedAt((startedAt) => startedAt || Date.now());
+          }
           if (event.type === "search") setSearching(event.query);
           if (event.type === "error") setError(event.message || "请求失败");
           if (event.type === "done" && event.conversation_id !== activeId)
@@ -240,6 +301,7 @@ function App() {
       if ((cause as Error).name !== "AbortError")
         setError((cause as Error).message || "发送失败");
     } finally {
+      outgoingAttachments.forEach((item) => item.preview && URL.revokeObjectURL(item.preview));
       setStreaming(false);
       cancelRef.current = undefined;
     }
@@ -365,7 +427,7 @@ function App() {
                     reasoning &&
                     index === messages.length - 1 && (
                       <details className="reasoning">
-                        <summary>思考过程</summary>
+                        <summary>思考过程{streaming && reasoningStartedAt ? " · " + formatElapsed(Date.now() - reasoningStartedAt) : ""}</summary>
                         <pre>{reasoning}</pre>
                       </details>
                     )}
@@ -393,13 +455,51 @@ function App() {
                 <Globe2 size={15} /> 正在通过 Firecrawl 搜索：{searching}
               </div>
             )}
+            {streaming && (
+              <div className="generation-status">正在生成 · {formatElapsed(elapsed)}</div>
+            )}
             <div ref={endRef} />
           </div>
           <div className="composer-container">
-            <div className="composer">
+            <div
+              className="composer"
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                void addFiles(Array.from(event.dataTransfer.files));
+              }}
+            >
+              <input
+                ref={fileInputRef}
+                className="attachment-input"
+                type="file"
+                multiple
+                onChange={(event) => {
+                  void addFiles(Array.from(event.target.files || []));
+                  event.target.value = "";
+                }}
+              />
+              {attachments.length > 0 && (
+                <div className="attachment-list">
+                  {attachments.map((item) => (
+                    <div className="attachment-chip" key={item.id}>
+                      {item.preview ? <img src={item.preview} alt="" /> : <Paperclip size={14} />}
+                      <span title={item.name}>{item.name}</span>
+                      <button title="移除附件" onClick={() => removeAttachment(item.id)}>×</button>
+                    </div>
+                  ))}
+                </div>
+              )}
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
+                onPaste={(event) => {
+                  const files = Array.from(event.clipboardData.files);
+                  if (files.length) {
+                    event.preventDefault();
+                    void addFiles(files);
+                  }
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
@@ -410,7 +510,7 @@ function App() {
                 rows={2}
               />
               <div className="composer-controls">
-                <button className="icon-button" title="添加附件">
+                <button className="icon-button" title="添加附件" onClick={() => fileInputRef.current?.click()}>
                   <Paperclip size={17} />
                 </button>
                 <button
@@ -441,7 +541,7 @@ function App() {
                   <button
                     title="发送"
                     className="send-button"
-                    disabled={!input.trim()}
+                    disabled={!input.trim() && !attachments.length}
                     onClick={() => void send()}
                   >
                     <Send size={17} />

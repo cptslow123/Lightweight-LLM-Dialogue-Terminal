@@ -1,9 +1,12 @@
 """Local API used by the portable Light Harness desktop window."""
 import asyncio
+import base64
+import binascii
 import json
 import os
 import shutil
 import sys
+import tempfile
 import tomllib
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -14,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1] / "cli"
 sys.path.insert(0, str(ROOT))
 from llm_harness import api, web  # noqa: E402
-from llm_harness.app import AUTO_SEARCH_PROMPT, SEARCH_RE, answer_mode_prompt  # noqa: E402
+from llm_harness.app import AUTO_SEARCH_PROMPT, MAX_AUTO_SEARCHES, SEARCH_RE, answer_mode_prompt  # noqa: E402
 from llm_harness.db import DB  # noqa: E402
 from llm_harness.settings import dump_toml  # noqa: E402
 
@@ -49,6 +52,51 @@ def text_content(content) -> str:
     return "".join(part.get("text", "") for part in content if part.get("type") == "text")
 
 
+def attachment_parts(items) -> tuple[list[dict], list[str]]:
+    """Convert browser-uploaded attachments into OpenAI message parts."""
+    parts: list[dict] = []
+    labels: list[str] = []
+    for item in items or []:
+        name = Path(str(item.get("name", "附件"))).name or "附件"
+        kind = item.get("kind")
+        if kind == "image":
+            data_url = str(item.get("data_url", ""))
+            if not data_url.startswith("data:image/"):
+                raise ValueError(f"图片 {name} 数据无效")
+            parts.append({"type": "image_url", "image_url": {"url": data_url}})
+            labels.append(f"图片：{name}")
+            continue
+        if kind == "text":
+            text = str(item.get("text", ""))
+            if not text:
+                raise ValueError(f"文件 {name} 为空")
+            parts.append({"type": "text", "text": f"[附件：{name}]\n{text[:api.MAX_FILE_CHARS]}"})
+            labels.append(f"文件：{name}")
+            continue
+        if kind == "binary":
+            encoded = str(item.get("base64", ""))
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise ValueError(f"文件 {name} 数据无效") from exc
+            if len(raw) > 20 * 1024 * 1024:
+                raise ValueError(f"文件 {name} 超过 20 MB 限制")
+            with tempfile.NamedTemporaryFile(suffix=Path(name).suffix, delete=False) as tmp:
+                tmp.write(raw)
+                temp_path = tmp.name
+            try:
+                text = api.extract_text(temp_path)
+            finally:
+                Path(temp_path).unlink(missing_ok=True)
+            if not text.strip():
+                raise ValueError(f"无法从文件 {name} 提取文本")
+            parts.append({"type": "text", "text": f"[附件：{name}]\n{text[:api.MAX_FILE_CHARS]}"})
+            labels.append(f"文件：{name}")
+            continue
+        raise ValueError(f"不支持的附件类型：{name}")
+    return parts, labels
+
+
 def public_message(row):
     content = json.loads(row["content"])
     return {"id": row["id"], "role": row["role"], "content": text_content(content), "summary": bool(row["summary"])}
@@ -77,7 +125,11 @@ def dated_system_prompt(conv, defaults: dict, search: bool) -> str:
     prompt = conv["system_prompt"] or defaults.get("system_prompt", "You are a helpful assistant.")
     now = datetime.now(timezone(timedelta(hours=8)))
     weekdays = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
-    prompt += f"\n当前时间（Asia/Shanghai）：{now.year}年{now.month}月{now.day}日，{weekdays[now.weekday()]}。"
+    prompt += (
+        f"\n当前时间（Asia/Shanghai）：{now.year}年{now.month}月{now.day}日，{weekdays[now.weekday()]}。"
+        "历史消息中的日期、星期和‘今天’、‘明天’等相对时间可能已过期；"
+        "回答当前日期或相对日期时，必须以当前时间为准。"
+    )
     return prompt + (AUTO_SEARCH_PROMPT if search else "")
 
 
@@ -205,13 +257,19 @@ class Handler(BaseHTTPRequestHandler):
         if not cid:
             cid = DB.new_conversation("新对话", model=payload.get("model", defaults.get("model", "")), thinking=payload.get("thinking", defaults.get("thinking", "off")))
         conv = DB.get_conversation(cid); user_text = api.clean_text(payload.get("message", "").strip())
-        if not user_text:
+        try:
+            parts, labels = attachment_parts(payload.get("attachments"))
+        except Exception as exc:
+            return self.send_json({"error": str(exc)}, 400)
+        if user_text:
+            parts.insert(0, {"type": "text", "text": user_text})
+        if not parts:
             return self.send_json({"error": "请输入消息"}, 400)
         provider = get_provider(cfg, payload.get("provider") or conv["provider"]); model = payload.get("model") or conv["model"] or defaults.get("model", "")
         thinking = payload.get("thinking") or conv["thinking"] or defaults.get("thinking", "off")
-        DB.add_message(cid, "user", [{"type": "text", "text": user_text}])
+        DB.add_message(cid, "user", parts)
         if conv["title"] in {"untitled", "新对话"}:
-            DB.update_conversation(cid, title=user_text[:30])
+            DB.update_conversation(cid, title=(user_text or "、".join(labels))[:30])
         DB.update_conversation(cid, provider=provider.get("name", "default"), model=model, thinking=thinking)
         self.send_response(200); self.send_header("Content-Type", "text/event-stream; charset=utf-8"); self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "close"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
         async def run():
@@ -233,7 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.emit({"type": "error", "message": error}); return
                 text = emitted
                 match = SEARCH_RE.match(text) if payload.get("search", True) else None
-                if not match or searches >= 3:
+                if not match or searches >= MAX_AUTO_SEARCHES:
                     DB.add_message(cid, "assistant", [{"type": "text", "text": text}])
                     self.emit({"type": "done", "text": text, "reasoning": reasoning, "usage": usage, "conversation_id": cid}); return
                 query = match.group(1).strip(); key = " ".join(query.lower().split())
@@ -246,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     self.emit({"type": "error", "message": f"联网搜索失败：{exc}"}); return
                 context = "[网络搜索结果] 查询: " + query + "\n" + "\n".join(f"{index}. {row.get('title', '')}\n{row.get('body', '')}\n来源: {row.get('href', '')}" for index, row in enumerate(results, 1))
-                DB.add_message(cid, "system", [{"type": "text", "text": context}]); history.append({"role": "system", "content": [{"type": "text", "text": context}]}); searches += 1; seen.add(key); prompt = dated_system_prompt(conv, defaults, False) + answer_mode_prompt(3 - searches); text = ""
+                DB.add_message(cid, "system", [{"type": "text", "text": context}]); history.append({"role": "system", "content": [{"type": "text", "text": context}]}); searches += 1; seen.add(key); prompt = dated_system_prompt(conv, defaults, False) + answer_mode_prompt(MAX_AUTO_SEARCHES - searches); text = ""
         try:
             asyncio.run(run())
         except (BrokenPipeError, ConnectionResetError):
